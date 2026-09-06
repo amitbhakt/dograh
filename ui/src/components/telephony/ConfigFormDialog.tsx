@@ -132,10 +132,6 @@ export function ConfigFormDialog({
       // filtering out of the generic credentials dialog.
       currentProvider?.fields.filter(
         (field) =>
-          // A readonly field reports a value the server assigned. Before the
-          // configuration exists there is nothing to report, and announcing a
-          // field that is not there yet reads as something the user forgot to
-          // fill in — so it appears only once it has a value.
           !(field.type === "readonly" && !values[field.name]) &&
           (!field.visible_when ||
             values[field.visible_when.field] === field.visible_when.equals),
@@ -166,13 +162,10 @@ export function ConfigFormDialog({
           const defaultProvider = list[0].provider;
           setProviderName(defaultProvider);
           if (defaultProvider === "whatsapp") {
-            const randomToken =
-              "dograh_wa_" +
-              Math.random().toString(36).substring(2, 10) +
-              Math.random().toString(36).substring(2, 10);
             setValues({
-              webhook_verify_token: randomToken,
+              webhook_verify_token: generateWhatsAppVerifyToken(),
               call_icon_visibility: "enabled",
+              business_initiated_calls_enabled: false,
             });
           } else {
             setValues({});
@@ -190,13 +183,10 @@ export function ConfigFormDialog({
   useEffect(() => {
     if (!isEdit) {
       if (providerName === "whatsapp") {
-        const randomToken =
-          "dograh_wa_" +
-          Math.random().toString(36).substring(2, 10) +
-          Math.random().toString(36).substring(2, 10);
         setValues({
-          webhook_verify_token: randomToken,
+          webhook_verify_token: generateWhatsAppVerifyToken(),
           call_icon_visibility: "enabled",
+          business_initiated_calls_enabled: false,
         });
       } else {
         setValues({});
@@ -230,6 +220,7 @@ export function ConfigFormDialog({
     field: TelephonyProviderMetadata["fields"][number],
     value: FieldValue,
   ) =>
+    field.name !== "from_numbers" &&
     field.required &&
     field.type !== "readonly" &&
     (value === undefined || value === null || value === "");
@@ -594,7 +585,10 @@ function FieldInput({ field, value, onChange, isEdit, error }: FieldInputProps) 
       >
         <SelectTrigger
           id={`cfg-field-${field.name}`}
-          className={cn(error && "border-destructive focus-visible:ring-destructive")}
+          className={cn(
+            "w-full max-w-full min-w-0 [&>span]:truncate",
+            error && "border-destructive focus-visible:ring-destructive",
+          )}
         >
           <SelectValue placeholder={placeholder || "Select an option"} />
         </SelectTrigger>

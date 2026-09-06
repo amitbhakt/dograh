@@ -6,7 +6,7 @@ import aiohttp
 from fastapi import HTTPException
 from loguru import logger
 
-from api.constants import ENABLE_DOGRAH_FLUX_STT, MPS_API_URL
+from api.constants import MPS_API_URL
 from api.errors.failure import (
     ErrorSource,
     annotate_failure_metadata,
@@ -169,8 +169,6 @@ DEEPGRAM_FLUX_LANGUAGE_HINTS = {
 
 
 def dograh_stt_uses_flux_language(language: str | None) -> bool:
-    if not ENABLE_DOGRAH_FLUX_STT:
-        return False
     language = language or "multi"
     return language in DEEPGRAM_FLUX_MULTILINGUAL_LANGUAGE_OPTIONS
 
@@ -694,7 +692,6 @@ def create_tts_service(
             base_url=base_url,
             api_key=user_config.tts.api_key,
             correlation_id=correlation_id,
-            sample_rate=audio_config.transport_out_sample_rate,
             settings=DograhTTSSettings(
                 model=user_config.tts.model,
                 voice=user_config.tts.voice,

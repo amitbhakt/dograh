@@ -179,7 +179,7 @@ export function PhoneNumberDialog({
               country_code: countryCode || undefined,
               label: label || undefined,
               is_active: isActive,
-              is_default_caller_id: isDefaultCallerId,
+              is_default_caller_id: !isWhatsApp && isDefaultCallerId,
               inbound_workflow_id: inboundId ?? undefined,
               telephony_trunk_id: selectedTrunkId ?? undefined,
             },
@@ -275,7 +275,7 @@ export function PhoneNumberDialog({
           <div className="space-y-1">
             <Label htmlFor="pn-workflow">Inbound workflow</Label>
             <Select value={inboundWorkflowId} onValueChange={setInboundWorkflowId}>
-              <SelectTrigger id="pn-workflow" className="w-full max-w-full overflow-hidden">
+              <SelectTrigger id="pn-workflow" className="w-full max-w-full overflow-hidden min-w-0 [&>span]:truncate [&>span]:min-w-0">
                 <SelectValue placeholder="(none)" />
               </SelectTrigger>
               <SelectContent>
@@ -300,7 +300,7 @@ export function PhoneNumberDialog({
             <div className="space-y-1">
               <Label htmlFor="pn-trunk">Outbound trunk</Label>
               <Select value={trunkId} onValueChange={setTrunkId}>
-                <SelectTrigger id="pn-trunk" className="w-full max-w-full overflow-hidden">
+                <SelectTrigger id="pn-trunk" className="w-full max-w-full overflow-hidden min-w-0 [&>span]:truncate [&>span]:min-w-0">
                   <SelectValue placeholder="(none)" />
                 </SelectTrigger>
                 <SelectContent>
@@ -328,7 +328,7 @@ export function PhoneNumberDialog({
             <Switch checked={isActive} onCheckedChange={setIsActive} />
           </div>
 
-          {!isEdit && (
+          {!isEdit && !isWhatsApp && (
             <div className="flex items-center justify-between rounded border p-3">
               <div>
                 <Label className="text-sm">Default caller ID for this configuration</Label>

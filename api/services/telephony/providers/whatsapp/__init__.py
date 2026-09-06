@@ -45,9 +45,7 @@ def _whatsapp_setup_checklist(
     state: ConfigurationSetupState,
 ) -> ProviderSetupChecklist:
     """Report that WhatsApp outbound calling is under development."""
-    return ProviderSetupChecklist(
-        ready_for_outbound=False,
-        outbound_blocked_reason="Outbound calling via WhatsApp is currently under development. Only inbound calling is supported.",
+    return ProviderSetupChecklist.from_steps(
         steps=[
             SetupStep(
                 key="outbound_unsupported",
@@ -79,7 +77,6 @@ def _config_loader(value: Dict[str, Any]) -> Dict[str, Any]:
         "phone_number_id": value.get("phone_number_id"),
         "webhook_verify_token": value.get("webhook_verify_token"),
         "app_secret": value.get("app_secret"),
-        "from_numbers": value.get("from_numbers", []),
         "business_initiated_calls_enabled": value.get("business_initiated_calls_enabled", False),
         "call_icon_visibility": value.get("call_icon_visibility", "enabled"),
     }
@@ -93,6 +90,7 @@ _UI_METADATA = ProviderUIMetadata(
             name="webhook_verify_token",
             label="Webhook Verify Token",
             type="text",
+            sensitive=True,
             section="Webhook Configuration",
             description="Paste this into Meta alongside Callback URL, click Verify and Save, and subscribe to the 'calls' field."
         ),
@@ -147,7 +145,7 @@ SPEC = ProviderSpec(
     provider_cls=WhatsAppProvider,
     config_loader=_config_loader,
     transport_factory=create_transport,
-    transport_sample_rate=48000,  # WhatsApp uses 48kHz OPUS codec
+    transport_sample_rate=16000,
     config_request_cls=WhatsAppConfigurationRequest,
     ui_metadata=_UI_METADATA,
     account_id_credential_field="phone_number_id",  # Used for webhook routing

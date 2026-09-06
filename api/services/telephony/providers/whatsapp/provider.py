@@ -373,8 +373,24 @@ class WhatsAppProvider(TelephonyProvider):
         if webhook_data.get("object") == "whatsapp_business_account":
             return True
 
-        entry = webhook_data.get("entry") or []
-        return bool(entry and isinstance(entry, list))
+        entry = webhook_data.get("entry")
+        if isinstance(entry, list) and entry:
+            for item in entry:
+                if isinstance(item, dict):
+                    changes = item.get("changes")
+                    if isinstance(changes, list):
+                        for change in changes:
+                            if isinstance(change, dict):
+                                if change.get("field") in ("calls", "messages"):
+                                    return True
+                                value = change.get("value")
+                                if isinstance(value, dict) and (
+                                    value.get("messaging_product") == "whatsapp"
+                                    or "calls" in value
+                                    or "call" in value
+                                ):
+                                    return True
+        return False
 
     @staticmethod
     def parse_inbound_webhook(webhook_data: Dict[str, Any]) -> NormalizedInboundData:
@@ -382,11 +398,15 @@ class WhatsAppProvider(TelephonyProvider):
         entry = webhook_data.get("entry", [{}])[0]
         changes = entry.get("changes", [{}])[0]
         value = changes.get("value", {})
-        call = value.get("call", {})
+        calls = value.get("calls")
+        if isinstance(calls, list) and calls:
+            call = calls[0]
+        else:
+            call = value.get("call", {})
         metadata = value.get("metadata", {})
 
         call_id = call.get("id") or value.get("call_id") or ""
-        from_number = call.get("from") or ""
+        from_number = call.get("from") or value.get("from") or ""
         to_number = call.get("to") or metadata.get("display_phone_number") or ""
         status = call.get("status") or value.get("status") or "unknown"
         direction = call.get("direction") or value.get("direction") or "inbound"
@@ -541,6 +561,21 @@ class WhatsAppProvider(TelephonyProvider):
 
         return Response(
             content=json.dumps({"error": error_type, "message": message}),
+            media_type="application/json",
+        )
+
+    @staticmethod
+    def generate_validation_error_response(error_type) -> Any:
+        """Generate WhatsApp-specific error response for validation failures."""
+        from fastapi import Response
+
+        from api.errors.telephony_errors import TELEPHONY_ERROR_MESSAGES, TelephonyError
+
+        message = TELEPHONY_ERROR_MESSAGES.get(
+            error_type, TELEPHONY_ERROR_MESSAGES[TelephonyError.GENERAL_AUTH_FAILED]
+        )
+        return Response(
+            content=json.dumps({"error": str(error_type), "message": message}),
             media_type="application/json",
         )
 

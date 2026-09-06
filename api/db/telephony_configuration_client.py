@@ -13,7 +13,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.future import select
 
 from api.db.base_client import BaseDBClient
-from api.db.models import CampaignModel, TelephonyConfigurationModel
+from api.db.models import CampaignModel, TelephonyConfigurationModel, TelephonyPhoneNumberModel
 
 
 class TelephonyConfigurationInUseError(Exception):
@@ -179,6 +179,75 @@ class TelephonyConfigurationClient(BaseDBClient):
                 )
             )
             return list(result.scalars().all())
+
+    async def get_whatsapp_configuration_by_phone_number_id(
+        self, phone_number_id: str
+    ) -> Optional[TelephonyConfigurationModel]:
+        """Look up an active WhatsApp telephony configuration by phone_number_id.
+
+        Matches either the phone_number_id stored directly in configuration
+        credentials or the phone_number_id stored in attached active phone
+        number extra_metadata (supporting WABA-level account setups).
+        """
+        async with self.async_session() as session:
+            # 1. Direct match on configuration credentials
+            stmt = select(TelephonyConfigurationModel).where(
+                TelephonyConfigurationModel.provider == "whatsapp",
+                TelephonyConfigurationModel.credentials.op("->>")(
+                    "phone_number_id"
+                )
+                == phone_number_id,
+                TelephonyConfigurationModel.inactive.is_(False),
+            )
+            result = await session.execute(stmt)
+            config = result.scalars().first()
+            if config:
+                return config
+
+            # 2. Match via attached phone number extra_metadata
+            stmt_phone = (
+                select(TelephonyConfigurationModel)
+                .join(
+                    TelephonyPhoneNumberModel,
+                    TelephonyPhoneNumberModel.telephony_configuration_id
+                    == TelephonyConfigurationModel.id,
+                )
+                .where(
+                    TelephonyConfigurationModel.provider == "whatsapp",
+                    TelephonyConfigurationModel.inactive.is_(False),
+                    TelephonyPhoneNumberModel.is_active.is_(True),
+                    (
+                        TelephonyPhoneNumberModel.extra_metadata.op("->>")(
+                            "phone_number_id"
+                        )
+                        == phone_number_id
+                    )
+                    | (
+                        TelephonyPhoneNumberModel.extra_metadata.op("->>")(
+                            "meta_phone_number_id"
+                        )
+                        == phone_number_id
+                    ),
+                )
+            )
+            result_phone = await session.execute(stmt_phone)
+            return result_phone.scalars().first()
+
+    async def get_whatsapp_configuration_by_verify_token(
+        self, verify_token: str
+    ) -> Optional[TelephonyConfigurationModel]:
+        """Look up an active WhatsApp config matching a webhook verify token."""
+        async with self.async_session() as session:
+            stmt = select(TelephonyConfigurationModel).where(
+                TelephonyConfigurationModel.provider == "whatsapp",
+                TelephonyConfigurationModel.credentials.op("->>")(
+                    "webhook_verify_token"
+                )
+                == verify_token,
+                TelephonyConfigurationModel.inactive.is_(False),
+            )
+            result = await session.execute(stmt)
+            return result.scalars().first()
 
     async def set_telephony_configuration_inactive(
         self, config_id: int, organization_id: int, reason: str

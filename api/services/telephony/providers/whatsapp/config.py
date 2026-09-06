@@ -26,30 +26,15 @@ class WhatsAppConfigurationRequest(BaseModel):
     """
     
     provider: Literal["whatsapp"] = Field(default="whatsapp")
-    access_token: str = Field(..., description="WhatsApp Business API access token")
-    phone_number_id: str = Field(..., description="Business phone number ID")
-    webhook_verify_token: str = Field(..., description="Webhook verification token")
-    app_secret: str = Field(..., description="App secret for webhook signature validation")
+    access_token: str = Field(..., min_length=1, description="WhatsApp Business API access token")
+    phone_number_id: str = Field(..., min_length=1, description="Business phone number ID")
+    webhook_verify_token: str = Field(..., min_length=1, description="Webhook verification token")
+    app_secret: str = Field(..., min_length=1, description="App secret for webhook signature validation")
     business_initiated_calls_enabled: bool = Field(
         default=False,
         description="Enable business-initiated calls to WhatsApp users"
     )
-    call_icon_visibility: str = Field(
+    call_icon_visibility: Literal["enabled", "disabled", "business_hours"] = Field(
         default="enabled",
         description="Control when call icon appears to users"
     )
-
-
-class WhatsAppConfigurationResponse(BaseModel):
-    """Response schema for WhatsApp configuration.
-    
-    This schema defines the masked response returned to the UI,
-    ensuring sensitive credentials are never exposed.
-    """
-    
-    provider: Literal["whatsapp"]
-    phone_number_id: str
-    webhook_verify_token: str
-    business_initiated_calls_enabled: bool
-    call_icon_visibility: str
-    # Sensitive fields (access_token, app_secret) are excluded

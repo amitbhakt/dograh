@@ -244,11 +244,15 @@ export const PhoneCallDialog = ({
         selectedConfig !== undefined && !isCallable(selectedConfig);
     // Nothing here can place a call: either the org has no configurations, or
     // the ones it has are still waiting on the customer's own carrier. An org
-    // whose only configurations are *inactive* is a different problem, so it
-    // falls through to the form rather than getting setup instructions.
+    // whose only configurations are *inactive* or intentionally inbound-only
+    // (such as WhatsApp) falls through to the form rather than getting setup instructions.
+    const hasConfiguredWhatsApp = telephonyConfigs.some(
+        (config) => !config.inactive && config.provider === "whatsapp",
+    );
     const needsPhoneService =
         needsConfiguration === true ||
-        (!telephonyConfigs.some(isCallable) &&
+        (!hasConfiguredWhatsApp &&
+            !telephonyConfigs.some(isCallable) &&
             telephonyConfigs.some(
                 (config) => !config.inactive && config.is_ready_for_outbound === false,
             ));
@@ -471,7 +475,7 @@ export const PhoneCallDialog = ({
                 <div className="flex flex-col gap-1.5">
                     <Label htmlFor="telephony-config">Telephony configuration</Label>
                     <Select value={selectedConfigId} onValueChange={setSelectedConfigId}>
-                        <SelectTrigger id="telephony-config" className="w-full max-w-full overflow-hidden">
+                        <SelectTrigger id="telephony-config" className="w-full max-w-full overflow-hidden min-w-0 [&>span]:truncate [&>span]:min-w-0">
                             <SelectValue placeholder="Select a configuration" />
                         </SelectTrigger>
                         <SelectContent>
@@ -526,7 +530,7 @@ export const PhoneCallDialog = ({
                             value={selectedFromPhoneNumberId}
                             onValueChange={setSelectedFromPhoneNumberId}
                         >
-                            <SelectTrigger id="from-phone-number" className="w-full max-w-full overflow-hidden">
+                            <SelectTrigger id="from-phone-number" className="w-full max-w-full overflow-hidden min-w-0 [&>span]:truncate [&>span]:min-w-0">
                                 <SelectValue placeholder="Select a phone number" />
                             </SelectTrigger>
                             <SelectContent>

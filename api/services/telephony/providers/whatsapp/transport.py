@@ -1,11 +1,7 @@
-"""WhatsApp WebRTC transport factory.
-
-This module creates WebRTC transports for WhatsApp voice calls using
-Pipecat's WhatsApp transport or custom implementation for OPUS codec
-at 48kHz with DTLS/SRTP encryption.
-"""
+"""WhatsApp transport factory."""
 
 from fastapi import WebSocket
+from loguru import logger
 from pipecat.transports.websocket.fastapi import (
     FastAPIWebsocketParams,
     FastAPIWebsocketTransport,
@@ -17,7 +13,7 @@ from api.services.pipecat.transport_params import realtime_param_overrides
 from api.services.telephony.factory import load_credentials_for_transport
 
 from .serializers import WhatsAppFrameSerializer
-from .strategies import WhatsAppTransferStrategy, WhatsAppHangupStrategy
+from .strategies import WhatsAppHangupStrategy, WhatsAppTransferStrategy
 
 
 async def create_transport(
@@ -31,33 +27,7 @@ async def create_transport(
     is_realtime: bool = False,
     call_id: str,
 ):
-    """
-    Create a WebRTC transport for WhatsApp voice calls.
-
-    This factory creates a Pipecat transport configured for WhatsApp's
-    WebRTC requirements: OPUS codec at 48kHz with DTLS/SRTP encryption.
-
-    Args:
-        websocket: FastAPI WebSocket connection
-        workflow_run_id: Workflow run identifier
-        audio_config: Audio configuration for the call
-        organization_id: Organization ID for credential lookup
-        ambient_noise_config: Optional ambient noise configuration
-        telephony_configuration_id: Telephony configuration ID
-        is_realtime: Whether to use realtime mode
-        call_id: WhatsApp call ID from Graph API
-
-    Returns:
-        Configured FastAPIWebsocketTransport for WhatsApp WebRTC
-
-    Raises:
-        ValueError: If required credentials are missing
-
-    Note:
-        WhatsApp uses 48kHz OPUS codec with WebRTC. The transport must
-        handle SDP offer/answer exchange with Meta's servers and support
-        ICE candidate negotiation for NAT traversal.
-    """
+    """Create a transport for WhatsApp connections."""
     config = await load_credentials_for_transport(
         organization_id, telephony_configuration_id, expected_provider="whatsapp"
     )
@@ -70,42 +40,33 @@ async def create_transport(
             f"Incomplete WhatsApp configuration for organization {organization_id}"
         )
 
-    # Create frame serializer with WhatsApp-specific strategies
     serializer = WhatsAppFrameSerializer(
         call_id=call_id,
         phone_number_id=phone_number_id,
         access_token=access_token,
         transfer_strategy=WhatsAppTransferStrategy(),
         hangup_strategy=WhatsAppHangupStrategy(),
+        sample_rate=audio_config.transport_in_sample_rate,
     )
 
-    # Build audio output mixer
-    audio_out_mixer = build_audio_out_mixer(audio_config)
-
-    # Apply realtime parameter overrides if needed
-    params = realtime_param_overrides(
-        audio_config=audio_config,
-        ambient_noise_config=ambient_noise_config,
-        is_realtime=is_realtime,
-    )
-
-    # Create WebRTC transport with WhatsApp configuration
-    transport = FastAPIWebsocketTransport(
-        websocket=websocket,
-        params=FastAPIWebsocketParams(
-            audio_in_sample_rate=audio_config.input_sample_rate,
-            audio_out_sample_rate=audio_config.output_sample_rate,
-            # WhatsApp-specific WebRTC parameters
-            # Add any additional WhatsApp-specific parameters here
-        ),
-        serializer=serializer,
-        audio_out_mixer=audio_out_mixer,
-        **params,
+    mixer = await build_audio_out_mixer(
+        audio_config.transport_out_sample_rate, ambient_noise_config
     )
 
     logger.info(
-        f"Created WhatsApp WebRTC transport for call_id={call_id}, "
+        f"Created WhatsApp transport for call_id={call_id}, "
         f"workflow_run_id={workflow_run_id}"
     )
 
-    return transport
+    return FastAPIWebsocketTransport(
+        websocket=websocket,
+        params=FastAPIWebsocketParams(
+            audio_in_enabled=True,
+            audio_out_enabled=True,
+            audio_in_sample_rate=audio_config.transport_in_sample_rate,
+            audio_out_sample_rate=audio_config.transport_out_sample_rate,
+            audio_out_mixer=mixer,
+            serializer=serializer,
+            **realtime_param_overrides(is_realtime),
+        ),
+    )

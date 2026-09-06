@@ -163,7 +163,16 @@ class TestWhatsAppProvider(IsolatedAsyncioTestCase):
             {"object": "whatsapp_business_account"}, {}
         ))
         self.assertTrue(WhatsAppProvider.can_handle_webhook(
+            {"entry": [{"changes": [{"field": "calls"}]}]}, {}
+        ))
+        self.assertTrue(WhatsAppProvider.can_handle_webhook(
+            {"entry": [{"changes": [{"value": {"messaging_product": "whatsapp"}}]}]}, {}
+        ))
+        self.assertFalse(WhatsAppProvider.can_handle_webhook(
             {"entry": [{"changes": []}]}, {}
+        ))
+        self.assertFalse(WhatsAppProvider.can_handle_webhook(
+            {"entry": [{"changes": [{"field": "feed"}]}]}, {}
         ))
         self.assertFalse(WhatsAppProvider.can_handle_webhook(
             {"something_else": True}, {}
@@ -206,6 +215,31 @@ class TestWhatsAppProvider(IsolatedAsyncioTestCase):
         self.assertEqual(res.direction, "inbound")
         self.assertEqual(res.call_status, "ringing")
         self.assertEqual(res.account_id, "test_phone_id")
+
+        # Also test with 'calls' array format
+        calls_array_webhook = {
+            "entry": [{
+                "changes": [{
+                    "field": "calls",
+                    "value": {
+                        "metadata": {
+                            "display_phone_number": "+15551234567",
+                            "phone_number_id": "test_phone_id",
+                        },
+                        "calls": [{
+                            "id": "call_id_999",
+                            "direction": "inbound",
+                            "from": "+15559876543",
+                            "to": "+15551234567",
+                            "status": "ringing",
+                        }],
+                    },
+                }],
+            }],
+        }
+        res_arr = WhatsAppProvider.parse_inbound_webhook(calls_array_webhook)
+        self.assertEqual(res_arr.provider, "whatsapp")
+        self.assertEqual(res_arr.call_id, "call_id_999")
 
     async def test_normalize_inbound_data_converts_whatsapp_webhook_to_standard_format(self):
         """Test WhatsApp webhook payloads convert to NormalizedInboundData."""
@@ -309,10 +343,12 @@ class TestWhatsAppProvider(IsolatedAsyncioTestCase):
             ("queued", TelephonyCallStatus.INITIATED),
             ("ringing", TelephonyCallStatus.RINGING),
             ("in-progress", TelephonyCallStatus.IN_PROGRESS),
+            ("answered", TelephonyCallStatus.ANSWERED),
             ("completed", TelephonyCallStatus.COMPLETED),
             ("failed", TelephonyCallStatus.FAILED),
             ("busy", TelephonyCallStatus.BUSY),
             ("no-answer", TelephonyCallStatus.NO_ANSWER),
+            ("canceled", TelephonyCallStatus.CANCELED),
             ("permission_requested", TelephonyCallStatus.INITIATED),
             ("permission_denied", TelephonyCallStatus.FAILED),
         ]
@@ -331,6 +367,15 @@ class TestWhatsAppProvider(IsolatedAsyncioTestCase):
         res = WhatsAppProvider.generate_error_response("ERR", "Something failed")
         self.assertIsInstance(res, Response)
         self.assertEqual(res.media_type, "application/json")
+
+    def test_generate_validation_error_response(self):
+        """Test generating validation error response."""
+        res = WhatsAppProvider.generate_validation_error_response("AUTH_FAILED")
+        self.assertIsInstance(res, Response)
+        self.assertEqual(res.media_type, "application/json")
+        body = json.loads(res.body.decode())
+        self.assertEqual(body["error"], "AUTH_FAILED")
+        self.assertIn("message", body)
 
     async def test_get_available_phone_numbers_direct(self):
         """Test fetching available phone numbers via direct phone number query."""
@@ -432,4 +477,39 @@ class TestWhatsAppProvider(IsolatedAsyncioTestCase):
         ):
             res = await provider.validate_phone_number("+15559999999")
             self.assertFalse(res.ok)
+
+    async def test_create_whatsapp_transport_success(self):
+        """Test create_transport constructs a valid FastAPIWebsocketTransport with 48 kHz audio config."""
+        from api.services.pipecat.audio_config import AudioConfig
+        from api.services.telephony.providers.whatsapp.transport import create_transport
+
+        mock_websocket = MagicMock()
+        audio_config = AudioConfig(
+            transport_in_sample_rate=48000,
+            transport_out_sample_rate=48000,
+            pipeline_in_sample_rate=16000,
+            pipeline_out_sample_rate=24000,
+        )
+        mock_credentials = {
+            "access_token": "valid_token",
+            "phone_number_id": "12345",
+        }
+
+        with patch(
+            "api.services.telephony.providers.whatsapp.transport.load_credentials_for_transport",
+            AsyncMock(return_value=mock_credentials),
+        ), patch(
+            "api.services.telephony.providers.whatsapp.transport.build_audio_out_mixer",
+            AsyncMock(return_value=None),
+        ):
+            transport = await create_transport(
+                websocket=mock_websocket,
+                workflow_run_id=101,
+                audio_config=audio_config,
+                organization_id=10,
+                call_id="call_test_123",
+            )
+            self.assertIsNotNone(transport)
+            self.assertEqual(transport._params.audio_in_sample_rate, 48000)
+            self.assertEqual(transport._params.audio_out_sample_rate, 48000)
 

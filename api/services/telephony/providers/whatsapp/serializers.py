@@ -22,6 +22,7 @@ class WhatsAppFrameSerializer(FrameSerializer):
         access_token: str,
         transfer_strategy=None,
         hangup_strategy=None,
+        sample_rate: int = 16000,
     ):
         """Initialize WhatsApp frame serializer.
 
@@ -31,19 +32,19 @@ class WhatsAppFrameSerializer(FrameSerializer):
             access_token: WhatsApp API access token
             transfer_strategy: Strategy for handling call transfers
             hangup_strategy: Strategy for handling call hangups
+            sample_rate: Sample rate for deserialized audio frames (default 16000)
         """
         self.call_id = call_id
         self.phone_number_id = phone_number_id
         self.access_token = access_token
         self.transfer_strategy = transfer_strategy
         self.hangup_strategy = hangup_strategy
+        self.sample_rate = sample_rate
 
     async def serialize(self, frame: AudioRawFrame) -> bytes:
         """Serialize audio frame to bytes for transmission."""
-        # WhatsApp transports raw audio bytes through the WebRTC layer.
         return frame.audio
 
     async def deserialize(self, data: bytes) -> InputAudioRawFrame:
         """Deserialize bytes to an input audio frame."""
-        # WhatsApp audio is transported as mono PCM at 48 kHz.
-        return InputAudioRawFrame(audio=data, sample_rate=48000, num_channels=1)
+        return InputAudioRawFrame(audio=data, sample_rate=self.sample_rate, num_channels=1)
