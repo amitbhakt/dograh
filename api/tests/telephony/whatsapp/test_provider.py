@@ -479,16 +479,15 @@ class TestWhatsAppProvider(IsolatedAsyncioTestCase):
             self.assertFalse(res.ok)
 
     async def test_create_whatsapp_transport_success(self):
-        """Test create_transport constructs a valid FastAPIWebsocketTransport with 48 kHz audio config."""
+        """Test create_transport constructs a valid FastAPIWebsocketTransport with 16 kHz audio config."""
         from api.services.pipecat.audio_config import AudioConfig
         from api.services.telephony.providers.whatsapp.transport import create_transport
 
         mock_websocket = MagicMock()
         audio_config = AudioConfig(
-            transport_in_sample_rate=48000,
-            transport_out_sample_rate=48000,
-            pipeline_in_sample_rate=16000,
-            pipeline_out_sample_rate=24000,
+            transport_in_sample_rate=16000,
+            transport_out_sample_rate=16000,
+            pipeline_sample_rate=16000,
         )
         mock_credentials = {
             "access_token": "valid_token",
@@ -510,6 +509,6 @@ class TestWhatsAppProvider(IsolatedAsyncioTestCase):
                 call_id="call_test_123",
             )
             self.assertIsNotNone(transport)
-            self.assertEqual(transport._params.audio_in_sample_rate, 48000)
-            self.assertEqual(transport._params.audio_out_sample_rate, 48000)
+            self.assertEqual(transport._params.audio_in_sample_rate, 16000)
+            self.assertEqual(transport._params.audio_out_sample_rate, 16000)
 

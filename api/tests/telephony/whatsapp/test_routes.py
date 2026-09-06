@@ -15,7 +15,7 @@ from api.services.telephony.providers.whatsapp.routes import (
 class TestWhatsAppRoutes(IsolatedAsyncioTestCase):
     def test_whatsapp_webhook_route_path_is_webhook(self):
         paths = [route.path for route in router.routes if getattr(route, "path", None)]
-        self.assertIn("/webhook", paths)
+        self.assertIn("/whatsapp/webhook", paths)
 
     async def test_whatsapp_webhook_verification_returns_plain_text_challenge(self):
         with patch(

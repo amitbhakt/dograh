@@ -38,3 +38,17 @@ class WhatsAppConfigurationRequest(BaseModel):
         default="enabled",
         description="Control when call icon appears to users"
     )
+
+
+class WhatsAppConfigurationResponse(BaseModel):
+    """Response schema for WhatsApp configuration.
+
+    This schema defines the masked response returned to the UI,
+    ensuring sensitive credentials are never exposed.
+    """
+
+    provider: Literal["whatsapp"] = Field(default="whatsapp")
+    phone_number_id: str
+    webhook_verify_token: str
+    business_initiated_calls_enabled: bool = False
+    call_icon_visibility: Literal["enabled", "disabled", "business_hours"] = "enabled"
