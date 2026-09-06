@@ -78,6 +78,7 @@ STACK_PUBLISHABLE_CLIENT_KEY = os.getenv("STACK_PUBLISHABLE_CLIENT_KEY")
 DOGRAH_MPS_SECRET_KEY = os.getenv("DOGRAH_MPS_SECRET_KEY", None)
 MPS_API_URL = os.getenv("MPS_API_URL", "https://services.dograh.com")
 DOGRAH_DEVOPS_SECRET = os.getenv("DOGRAH_DEVOPS_SECRET") or None
+WHATSAPP_WEBHOOK_VERIFY_TOKEN = os.getenv("WHATSAPP_WEBHOOK_VERIFY_TOKEN") or None
 
 # Storage Configuration
 ENABLE_AWS_S3 = os.getenv("ENABLE_AWS_S3", "false").lower() == "true"
@@ -269,3 +270,11 @@ OSS_JWT_SECRET = os.getenv("OSS_JWT_SECRET", "change-me-in-production")
 OSS_JWT_EXPIRY_HOURS = int(os.getenv("OSS_JWT_EXPIRY_HOURS", "720"))  # 30 days
 
 TUNER_BASE_URL = os.getenv("TUNER_BASE_URL", "https://api.usetuner.ai")
+
+# Deepgram Flux STT via Dograh managed service (MPS) proxy.
+# Defaults to true only in test environment; in local/production deployments,
+# defaults to false so Dograh uses standard Nova-2 streaming STT unless explicitly enabled.
+ENABLE_DOGRAH_FLUX_STT = os.getenv(
+    "ENABLE_DOGRAH_FLUX_STT",
+    "true" if os.getenv("ENVIRONMENT") == Environment.TEST.value else "false",
+).lower() == "true"

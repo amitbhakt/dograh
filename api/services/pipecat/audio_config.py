@@ -97,9 +97,11 @@ def create_audio_config(transport_type: str) -> AudioConfig:
         )
         rate = 16000
 
+    vad_rate = rate if rate in (8000, 16000) else 16000
+    pipeline_rate = min(rate, 16000)
     return AudioConfig(
         transport_in_sample_rate=rate,
         transport_out_sample_rate=rate,
-        vad_sample_rate=rate,
-        pipeline_sample_rate=rate,
+        vad_sample_rate=vad_rate,
+        pipeline_sample_rate=pipeline_rate,
     )

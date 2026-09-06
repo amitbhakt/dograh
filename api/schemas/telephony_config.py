@@ -34,6 +34,9 @@ from api.services.telephony.providers.vobiz.config import (
 from api.services.telephony.providers.vonage.config import (
     VonageConfigurationRequest,
 )
+from api.services.telephony.providers.whatsapp.config import (
+    WhatsAppConfigurationRequest,
+)
 from api.services.telephony.registry import (
     ProviderConnectivity,
     ProviderSetupChecklist,
@@ -51,6 +54,7 @@ TelephonyConfigRequest = Annotated[
         TwilioConfigurationRequest,
         VobizConfigurationRequest,
         VonageConfigurationRequest,
+        WhatsAppConfigurationRequest,
     ],
     Field(discriminator="provider"),
 ]
@@ -188,4 +192,5 @@ __all__ = [
     "TwilioConfigurationRequest",
     "VobizConfigurationRequest",
     "VonageConfigurationRequest",
+    "WhatsAppConfigurationRequest",
 ]

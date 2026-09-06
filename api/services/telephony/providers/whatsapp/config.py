@@ -1,0 +1,55 @@
+"""WhatsApp telephony configuration schemas.
+
+This module defines Pydantic models for WhatsApp Business API configuration,
+following Dograh's telephony provider configuration pattern.
+"""
+
+from typing import Literal, Optional
+
+from pydantic import BaseModel, Field
+
+
+class WhatsAppConfigurationRequest(BaseModel):
+    """Request schema for WhatsApp configuration.
+    
+    This schema validates incoming configuration save requests and
+    integrates with Dograh's metadata-driven UI forms.
+    
+    Attributes:
+        provider: Literal discriminator for union typing
+        access_token: WhatsApp Business API access token
+        phone_number_id: Business phone number ID from Meta
+        webhook_verify_token: Token for webhook verification
+        app_secret: App secret for webhook signature validation
+        business_initiated_calls_enabled: Enable outbound calling
+        call_icon_visibility: Control call icon display in WhatsApp
+    """
+    
+    provider: Literal["whatsapp"] = Field(default="whatsapp")
+    access_token: str = Field(..., description="WhatsApp Business API access token")
+    phone_number_id: str = Field(..., description="Business phone number ID")
+    webhook_verify_token: str = Field(..., description="Webhook verification token")
+    app_secret: str = Field(..., description="App secret for webhook signature validation")
+    business_initiated_calls_enabled: bool = Field(
+        default=False,
+        description="Enable business-initiated calls to WhatsApp users"
+    )
+    call_icon_visibility: str = Field(
+        default="enabled",
+        description="Control when call icon appears to users"
+    )
+
+
+class WhatsAppConfigurationResponse(BaseModel):
+    """Response schema for WhatsApp configuration.
+    
+    This schema defines the masked response returned to the UI,
+    ensuring sensitive credentials are never exposed.
+    """
+    
+    provider: Literal["whatsapp"]
+    phone_number_id: str
+    webhook_verify_token: str
+    business_initiated_calls_enabled: bool
+    call_icon_visibility: str
+    # Sensitive fields (access_token, app_secret) are excluded
