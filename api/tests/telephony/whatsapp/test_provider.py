@@ -559,22 +559,6 @@ class TestWhatsAppConfigurationDisplayAndMerge(IsolatedAsyncioTestCase):
         self.assertEqual(request_dict["app_secret"], "secret_app_secret_value")
         self.assertEqual(request_dict["webhook_verify_token"], "secret_verify_token_value")
 
-    def test_preserve_masked_fields_restores_stored_secrets_when_omitted_or_empty(self):
-        """When UI or client omits secrets or submits empty string on update, stored values are preserved."""
-        request_dict = {
-            "provider": "whatsapp",
-            "phone_number_id": "106540352242922",
-            "access_token": None,
-            "app_secret": "",
-            "webhook_verify_token": None,
-        }
-
-        self.preserve_masked_fields("whatsapp", request_dict, self.stored)
-
-        self.assertEqual(request_dict["access_token"], "secret_access_token_value")
-        self.assertEqual(request_dict["app_secret"], "secret_app_secret_value")
-        self.assertEqual(request_dict["webhook_verify_token"], "secret_verify_token_value")
-
     def test_preserve_masked_fields_accepts_new_secrets_when_updated(self):
         """When user provides a new real secret, it is not overwritten by existing value."""
         request_dict = {
@@ -590,5 +574,47 @@ class TestWhatsAppConfigurationDisplayAndMerge(IsolatedAsyncioTestCase):
         self.assertEqual(request_dict["access_token"], "new_rotated_access_token")
         self.assertEqual(request_dict["app_secret"], "new_rotated_app_secret")
         self.assertEqual(request_dict["webhook_verify_token"], "new_rotated_verify_token")
+
+    def test_preserve_masked_fields_allows_clearing_optional_secrets(self):
+        """When an optional sensitive credential is set to None or empty, it is not restored."""
+        stored_vonage = {
+            "api_key": "k1",
+            "api_secret": "secret_key_12345",
+            "application_id": "app1",
+            "private_key": "private_key_data_here",
+            "signature_secret": "existing_sig_secret",
+        }
+        displayed = self._credentials_for_display("vonage", stored_vonage)
+        request_dict = dict(displayed)
+        request_dict["signature_secret"] = None  # user explicitly cleared
+        self.preserve_masked_fields("vonage", request_dict, stored_vonage)
+        self.assertEqual(request_dict["api_secret"], "secret_key_12345")
+        self.assertEqual(request_dict["private_key"], "private_key_data_here")
+        self.assertIsNone(request_dict["signature_secret"])
+
+    def test_whatsapp_configuration_request_requires_fields(self):
+        """WhatsAppConfigurationRequest enforces all required credential fields directly."""
+        from api.services.telephony.providers.whatsapp.config import WhatsAppConfigurationRequest
+        from pydantic import ValidationError
+
+        with self.assertRaises(ValidationError) as ctx:
+            WhatsAppConfigurationRequest(phone_number_id="12345")
+        errors = {e["loc"][0] for e in ctx.exception.errors()}
+        self.assertIn("access_token", errors)
+        self.assertIn("app_secret", errors)
+        self.assertIn("webhook_verify_token", errors)
+
+    def test_whatsapp_configuration_request_accepts_masked_values_for_update(self):
+        """WhatsAppConfigurationRequest accepts masked values populated by edit dialog."""
+        from api.services.telephony.providers.whatsapp.config import WhatsAppConfigurationRequest
+
+        displayed = self._credentials_for_display("whatsapp", self.stored)
+        req = WhatsAppConfigurationRequest(**displayed)
+        self.assertTrue(req.access_token.startswith("****"))
+
+        req_dict = req.model_dump()
+        self.preserve_masked_fields("whatsapp", req_dict, self.stored)
+        self.assertEqual(req_dict["access_token"], "secret_access_token_value")
+        self.assertEqual(req_dict["app_secret"], "secret_app_secret_value")
 
 
