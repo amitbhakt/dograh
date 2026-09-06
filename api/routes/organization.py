@@ -68,7 +68,12 @@ from api.services.configuration.ai_model_configuration import (
 )
 from api.services.configuration.check_validity import UserConfigurationValidator
 from api.services.configuration.defaults import DEFAULT_SERVICE_PROVIDERS
-from api.services.configuration.masking import is_mask_of, mask_key, mask_user_config
+from api.services.configuration.masking import (
+    is_mask_of,
+    mask_key,
+    mask_user_config,
+    restore_masked_fields,
+)
 from api.services.configuration.registry import (
     DOGRAH_MULTILINGUAL_AUTODETECT_LANGUAGES,
     DOGRAH_STT_LANGUAGES,
@@ -651,61 +656,13 @@ async def get_model_configuration_preferences_legacy(
     return await get_preferences(user=user)
 
 
-def _has_nested_field(value: dict, dotted_path: str) -> bool:
+def _get_nested_field(value: dict, dotted_path: str) -> Any:
+    """Resolve a dotted path in a nested dict, or None when it is not there."""
     current = value
     for part in dotted_path.split("."):
         if not isinstance(current, dict) or part not in current:
-            return False
-        current = current[part]
-    return True
-
-
-def _get_model_fields_set_paths(model: Any, prefix: str = "") -> set[str]:
-    """Recursively collect dotted field paths that were explicitly set on a Pydantic model."""
-    if not hasattr(model, "model_fields_set"):
-        return set()
-    paths = set()
-    for field in model.model_fields_set:
-        full_path = f"{prefix}.{field}" if prefix else field
-        paths.add(full_path)
-        val = getattr(model, field, None)
-        if hasattr(val, "model_fields_set"):
-            paths.update(_get_model_fields_set_paths(val, prefix=full_path))
-    return paths
-
-
-def preserve_masked_fields(
-    provider: str,
-    request_dict: dict,
-    existing: dict,
-    fields_set: set[str] | None = None,
-):
-    """If the client re-submitted a masked sensitive field or omitted it on update, restore the original.
-
-    Preserves omitted fields from stored configuration while allowing explicit
-    null/empty clears.
-    """
-    for field_name in _sensitive_fields(provider):
-        v = _get_nested_field(request_dict, field_name)
-        existing_value = _get_nested_field(existing, field_name)
-        if not existing_value:
-            continue
-
-        if fields_set is not None:
-            is_omitted = field_name not in fields_set
-        else:
-            is_omitted = not _has_nested_field(request_dict, field_name)
-
-        if is_omitted or (v and is_mask_of(v, existing_value)):
-            _set_nested_field(request_dict, field_name, existing_value)
-
-
-def _get_nested_field(value: dict, dotted_path: str):
-    current = value
-    for part in dotted_path.split("."):
-        if not isinstance(current, dict):
             return None
-        current = current.get(part)
+        current = current[part]
     return current
 
 
@@ -719,6 +676,44 @@ def _set_nested_field(value: dict, dotted_path: str, field_value) -> None:
             current[part] = child
         current = child
     current[parts[-1]] = field_value
+
+
+def _get_model_fields_set_paths(model: BaseModel, prefix: str = "") -> set[str]:
+    """Recursively collect dotted field paths that were explicitly set on a Pydantic model.
+
+    A nested path is only recorded under a parent that was itself set, so the
+    result is ancestor-closed: ``"a.b" in paths`` implies ``"a" in paths``.
+    ``preserve_masked_fields`` leans on that — it can settle "did the caller
+    say anything about this path?" with one membership test.
+    """
+    paths = set()
+    for field in model.model_fields_set:
+        full_path = f"{prefix}.{field}" if prefix else field
+        paths.add(full_path)
+        val = getattr(model, field, None)
+        if isinstance(val, BaseModel):
+            paths.update(_get_model_fields_set_paths(val, prefix=full_path))
+    return paths
+
+
+def preserve_masked_fields(
+    provider: str,
+    request_dict: dict,
+    existing: dict,
+    fields_set: set[str],
+) -> None:
+    """Restore stored secrets the caller re-submitted masked or left out.
+
+    Provider-aware wrapper: the registry says which paths are sensitive, and
+    ``restore_masked_fields`` does the merge. ``fields_set`` comes from
+    ``_get_model_fields_set_paths``, whose ancestor-closure it relies on.
+    """
+    restore_masked_fields(
+        request_dict,
+        existing,
+        fields_set,
+        sensitive_paths=_sensitive_fields(provider),
+    )
 
 
 def _credentials_from_payload(config: TelephonyConfigRequest) -> dict:
