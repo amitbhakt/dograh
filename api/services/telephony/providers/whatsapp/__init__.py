@@ -35,7 +35,7 @@ from api.services.telephony.registry import (
     register,
 )
 
-from .config import WhatsAppConfigurationRequest, WhatsAppConfigurationResponse
+from .config import WhatsAppConfigurationRequest
 from .provider import WhatsAppProvider
 from .transport import create_transport
 
@@ -147,7 +147,6 @@ SPEC = ProviderSpec(
     transport_factory=create_transport,
     transport_sample_rate=16000,
     config_request_cls=WhatsAppConfigurationRequest,
-    config_response_cls=WhatsAppConfigurationResponse,
     ui_metadata=_UI_METADATA,
     account_id_credential_field="phone_number_id",  # Used for webhook routing
     # WhatsApp is a carrier you buy numbers from, not BYO-SIP
@@ -164,7 +163,6 @@ register(SPEC)
 __all__ = [
     "SPEC",
     "WhatsAppConfigurationRequest",
-    "WhatsAppConfigurationResponse",
     "WhatsAppProvider",
     "create_transport",
 ]

@@ -74,7 +74,7 @@ async def _get_redis() -> Optional[aioredis.Redis]:
     global _redis_client
     if _redis_client is None:
         try:
-            _redis_client = await aioredis.from_url(REDIS_URL, decode_responses=True)
+            _redis_client = aioredis.from_url(REDIS_URL, decode_responses=True)
         except Exception as e:
             logger.warning(f"[WhatsApp] Failed to connect to Redis: {e}")
             return None
@@ -90,7 +90,7 @@ def _ensure_redis_subscriber() -> None:
 async def _listen_for_remote_terminates() -> None:
     """Listen for cross-worker terminate events on Redis pub/sub and disconnect local peer."""
     try:
-        redis = await aioredis.from_url(REDIS_URL, decode_responses=True)
+        redis = aioredis.from_url(REDIS_URL, decode_responses=True)
         pubsub = redis.pubsub()
         await pubsub.subscribe(REDIS_TERMINATE_CHANNEL)
         async for message in pubsub.listen():
@@ -573,9 +573,10 @@ async def _handle_inbound_call_connect(
 
     except Exception as e:
         logger.error(f"[WhatsApp] Failed to initialize workflow run: {e}")
-        if slot_bound and workflow_run:
-            await call_concurrency.release_workflow_run_slot(workflow_run.id)
+        if workflow_run:
             await mark_workflow_run_failed(workflow_run.id, str(e))
+        if slot_bound:
+            await call_concurrency.release_workflow_run_slot(workflow_run.id)
         else:
             await call_concurrency.release_slot(concurrency_slot)
         await _reject_whatsapp_call(phone_number_id, call_id, access_token)
@@ -683,7 +684,13 @@ async def _run_whatsapp_pipeline(
             f"[WhatsApp] Pipeline error for workflow_run {workflow_run_id}: {e}",
             exc_info=True,
         )
-        await mark_workflow_run_failed(workflow_run_id, str(e))
+        # Only mark failed if terminate handler has not already finalized the run
+        try:
+            existing = await db_client.get_workflow_run_by_id(workflow_run_id)
+            if existing and not existing.is_completed:
+                await mark_workflow_run_failed(workflow_run_id, str(e))
+        except Exception:
+            await mark_workflow_run_failed(workflow_run_id, str(e))
     finally:
         _active_connections.pop(call_id, None)
         try:

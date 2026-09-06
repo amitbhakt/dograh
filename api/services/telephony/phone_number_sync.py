@@ -8,6 +8,10 @@ from api.db import db_client
 from api.db.telephony_phone_number_client import TelephonyPhoneNumberConflictError
 from api.schemas.telephony_phone_number import ProviderSyncStatus
 from api.services.telephony.factory import get_telephony_provider_by_id
+from api.services.telephony.inbound_routing import (
+    InboundRoutingConflictError,
+    assert_no_inbound_routing_conflict,
+)
 from api.utils.telephony_address import normalize_telephony_address
 
 
@@ -56,6 +60,11 @@ async def sync_available_phone_numbers_for_config(
     has_default_caller = any(row.is_default_caller_id for row in existing_rows)
     imported = 0
     skipped = 0
+    deactivated = 0
+
+    config_row = await db_client.get_telephony_configuration(config_id)
+    provider_name = config_row.provider if config_row else None
+    provider_credentials = config_row.credentials if config_row else None
 
     for item in records:
         address = item.get("address")
@@ -86,6 +95,13 @@ async def sync_available_phone_numbers_for_config(
             continue
 
         try:
+            if provider_name:
+                await assert_no_inbound_routing_conflict(
+                    provider=provider_name,
+                    credentials=provider_credentials,
+                    addresses=[normalized],
+                    organization_id=organization_id,
+                )
             await db_client.create_phone_number(
                 organization_id=organization_id,
                 telephony_configuration_id=config_id,
@@ -104,9 +120,39 @@ async def sync_available_phone_numbers_for_config(
                 f"Skipping already-existing phone number {address!r} while syncing "
                 f"config {config_id}"
             )
+        except InboundRoutingConflictError:
+            skipped += 1
+            logger.warning(
+                f"Skipping conflicting phone number {address!r} while syncing config {config_id}: "
+                "already registered on another inbound route"
+            )
 
-    if imported:
-        message = f"Imported {imported} phone number(s)."
+    # Issue 1: deactivate rows that are no longer present in the provider result.
+    discovered = {
+        normalize_telephony_address(item["address"]).canonical
+        for item in records
+        if item.get("address")
+    }
+    for row in existing_rows:
+        if row.is_active and row.address_normalized and row.address_normalized not in discovered:
+            await db_client.update_phone_number(
+                phone_number_id=row.id,
+                telephony_configuration_id=config_id,
+                is_active=False,
+            )
+            deactivated += 1
+            logger.info(
+                f"Deactivated stale phone number {row.address_normalized!r} for config {config_id}: "
+                "no longer present in provider result"
+            )
+
+    if imported or deactivated:
+        parts = []
+        if imported:
+            parts.append(f"Imported {imported} phone number(s).")
+        if deactivated:
+            parts.append(f"Deactivated {deactivated} stale phone number(s).")
+        message = " ".join(parts)
         if skipped:
             message += f" Skipped {skipped} duplicate or invalid number(s)."
         return ProviderSyncStatus(ok=True, message=message)

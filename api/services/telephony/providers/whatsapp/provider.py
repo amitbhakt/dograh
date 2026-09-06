@@ -575,7 +575,7 @@ class WhatsAppProvider(TelephonyProvider):
             error_type, TELEPHONY_ERROR_MESSAGES[TelephonyError.GENERAL_AUTH_FAILED]
         )
         return Response(
-            content=json.dumps({"error": str(error_type), "message": message}),
+            content=json.dumps({"error": error_type.value if hasattr(error_type, "value") else str(error_type), "message": message}),
             media_type="application/json",
         )
 

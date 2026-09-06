@@ -246,12 +246,18 @@ export const PhoneCallDialog = ({
     // the ones it has are still waiting on the customer's own carrier. An org
     // whose only configurations are *inactive* or intentionally inbound-only
     // (such as WhatsApp) falls through to the form rather than getting setup instructions.
-    const hasConfiguredWhatsApp = telephonyConfigs.some(
-        (config) => !config.inactive && config.provider === "whatsapp",
+    // Suppress setup guidance only when every not-yet-callable non-inactive config
+    // is WhatsApp (inbound-only). If there are non-WhatsApp configs awaiting carrier
+    // setup, still surface the pointer to finish outbound configuration.
+    const hasNonWhatsAppPendingOutbound = telephonyConfigs.some(
+        (config) =>
+            !config.inactive &&
+            config.provider !== "whatsapp" &&
+            config.is_ready_for_outbound === false,
     );
     const needsPhoneService =
         needsConfiguration === true ||
-        (!hasConfiguredWhatsApp &&
+        (hasNonWhatsAppPendingOutbound &&
             !telephonyConfigs.some(isCallable) &&
             telephonyConfigs.some(
                 (config) => !config.inactive && config.is_ready_for_outbound === false,

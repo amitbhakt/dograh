@@ -403,6 +403,9 @@ class TestWhatsAppInboundCalling(IsolatedAsyncioTestCase):
         ), patch(
             "api.services.call_concurrency.call_concurrency.release_workflow_run_slot",
             AsyncMock(),
+        ), patch(
+            "api.services.telephony.providers.whatsapp.routes._get_redis",
+            AsyncMock(return_value=None),
         ):
             response = await handle_whatsapp_webhook(request)
 
@@ -440,7 +443,10 @@ class TestWhatsAppInboundCalling(IsolatedAsyncioTestCase):
         ) as mock_update, patch(
             "api.services.call_concurrency.call_concurrency.release_workflow_run_slot",
             AsyncMock(),
-        ) as mock_release:
+        ) as mock_release, patch(
+            "api.services.telephony.providers.whatsapp.routes._get_redis",
+            AsyncMock(return_value=None),
+        ):
             response = await handle_whatsapp_webhook(request)
 
             self.assertEqual(response, {"status": "success"})

@@ -12,7 +12,9 @@ class WhatsAppFrameSerializer(FrameSerializer):
     """Frame serializer for WhatsApp WebRTC connections.
 
     Handles serialization/deserialization of audio frames for WhatsApp's
-    WebRTC media transport with OPUS codec at 48kHz.
+    WebRTC media transport. The `sample_rate` passed at construction time
+    must match the transport's `audio_in_sample_rate` so that downstream
+    processors receive frames labelled at the correct wire rate.
     """
 
     def __init__(

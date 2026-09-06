@@ -6,6 +6,8 @@ Each row represents one provider account that an organization has connected
 """
 
 from datetime import UTC, datetime
+
+from loguru import logger
 from typing import Any, Dict, List, Optional
 
 from sqlalchemy import func, update
@@ -200,7 +202,16 @@ class TelephonyConfigurationClient(BaseDBClient):
                 TelephonyConfigurationModel.inactive.is_(False),
             )
             result = await session.execute(stmt)
-            config = result.scalars().first()
+            rows = result.scalars().all()
+            if len(rows) > 1:
+                ids = ", ".join(str(r.id) for r in rows)
+                logger.error(
+                    f"[WhatsApp] Ambiguous phone_number_id={phone_number_id!r}: "
+                    f"matches {len(rows)} active configurations ({ids}). "
+                    f"Rejecting inbound call to prevent wrong-tenant routing."
+                )
+                return None  # caller will reject the call
+            config = rows[0] if rows else None
             if config:
                 return config
 
@@ -231,7 +242,16 @@ class TelephonyConfigurationClient(BaseDBClient):
                 )
             )
             result_phone = await session.execute(stmt_phone)
-            return result_phone.scalars().first()
+            rows_phone = result_phone.scalars().all()
+            if len(rows_phone) > 1:
+                ids = ", ".join(str(r.id) for r in rows_phone)
+                logger.error(
+                    f"[WhatsApp] Ambiguous phone_number_id={phone_number_id!r} via extra_metadata: "
+                    f"matches {len(rows_phone)} active configurations ({ids}). "
+                    f"Rejecting inbound call."
+                )
+                return None
+            return rows_phone[0] if rows_phone else None
 
     async def get_whatsapp_configuration_by_verify_token(
         self, verify_token: str

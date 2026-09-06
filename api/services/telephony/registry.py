@@ -303,7 +303,6 @@ class ProviderSpec:
     transport_factory: TransportFactory
     transport_sample_rate: int
     config_request_cls: Type[BaseModel]
-    config_response_cls: Optional[Type[BaseModel]] = None
     ui_metadata: Optional[ProviderUIMetadata] = None
     # Credential field that uniquely identifies the provider account. Used to
     # (a) match an inbound webhook to the right org config when multiple configs
