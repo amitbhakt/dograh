@@ -630,17 +630,24 @@ class WhatsAppProvider(TelephonyProvider):
 
         # 1. Query the configured phone_number_id directly for display_phone_number
         phone_number_endpoint = f"{self.GRAPH_API_BASE_URL}/{self.phone_number_id}"
+        waba_id: Optional[str] = None
+        self.is_full_inventory = False
         async with aiohttp.ClientSession() as session:
             try:
                 async with session.get(
                     phone_number_endpoint,
                     headers=headers,
-                    params={"fields": "display_phone_number,verified_name,id"},
+                    params={
+                        "fields": "display_phone_number,verified_name,id,whatsapp_business_account"
+                    },
                 ) as response:
                     if response.status == 200:
                         payload = await response.json()
                         direct_number = payload.get("display_phone_number")
                         direct_id = payload.get("id") or self.phone_number_id
+                        waba_info = payload.get("whatsapp_business_account")
+                        if isinstance(waba_info, dict) and waba_info.get("id"):
+                            waba_id = str(waba_info["id"])
                         if direct_number:
                             try:
                                 canonical = normalize_telephony_address(
@@ -669,13 +676,18 @@ class WhatsAppProvider(TelephonyProvider):
             except Exception as e:
                 logger.warning(f"Error querying direct phone number endpoint: {e}")
 
-            # 2. If direct lookup did not resolve a number, try the /phone_numbers edge
-            # (useful when the configured ID is a WhatsApp Business Account / WABA ID)
-            if not records:
-                waba_endpoint = f"{self.GRAPH_API_BASE_URL}/{self.phone_number_id}/phone_numbers"
+            # 2. Query the /phone_numbers edge on the WABA:
+            # - If step 1 gave us waba_id, query {waba_id}/phone_numbers to discover
+            #   all other numbers belonging to this WhatsApp Business Account.
+            # - If direct lookup did not resolve a number (e.g. self.phone_number_id is
+            #   itself a WABA ID), query {self.phone_number_id}/phone_numbers.
+            target_waba = waba_id or (self.phone_number_id if not records else None)
+            if target_waba:
+                waba_endpoint = f"{self.GRAPH_API_BASE_URL}/{target_waba}/phone_numbers"
                 try:
                     async with session.get(waba_endpoint, headers=headers) as response:
                         if response.status == 200:
+                            self.is_full_inventory = True
                             payload = await response.json()
                             for record in payload.get("data") or []:
                                 display_phone_number = record.get("display_phone_number")
@@ -691,8 +703,8 @@ class WhatsAppProvider(TelephonyProvider):
                                         records.append({
                                             "address": canonical,
                                             "extra_metadata": {
-                                                "meta_phone_number_id": str(phone_id or self.phone_number_id),
-                                                "phone_number_id": str(phone_id or self.phone_number_id),
+                                                "meta_phone_number_id": str(phone_id or target_waba),
+                                                "phone_number_id": str(phone_id or target_waba),
                                             },
                                         })
                                 except ValueError:
@@ -703,7 +715,7 @@ class WhatsAppProvider(TelephonyProvider):
                         else:
                             error_text = await response.text()
                             logger.warning(
-                                f"Query on /phone_numbers edge for ID {self.phone_number_id} "
+                                f"Query on /phone_numbers edge for ID {target_waba} "
                                 f"returned {response.status}: {error_text}"
                             )
                 except Exception as e:

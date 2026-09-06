@@ -23,7 +23,12 @@ from api.services.workflow.disposition_mapping import map_disposition
 from api.tasks.function_names import FunctionNames
 
 
-async def mark_workflow_run_failed(workflow_run_id: int, error_message: str) -> None:
+async def mark_workflow_run_failed(
+    workflow_run_id: int,
+    error_message: str,
+    *,
+    only_if_incomplete: bool = False,
+) -> None:
     """Complete the run with a user-visible error and notify integrations.
 
     Best-effort: callers invoke this while rejecting a call, so a bookkeeping
@@ -62,6 +67,7 @@ async def mark_workflow_run_failed(workflow_run_id: int, error_message: str) -> 
                 "call_status": error_disposition,
             },
             logs={"realtime_feedback_events": [failure_event]},
+            only_if_incomplete=only_if_incomplete,
         )
     except Exception as e:  # noqa: BLE001 - bookkeeping must remain best-effort
         logger.error(f"Failed to record failure on workflow run {workflow_run_id}: {e}")

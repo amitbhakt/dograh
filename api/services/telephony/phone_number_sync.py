@@ -57,10 +57,15 @@ async def sync_available_phone_numbers_for_config(
     existing_map = {
         row.address_normalized: row for row in existing_rows if row.address_normalized
     }
-    has_default_caller = any(row.is_default_caller_id for row in existing_rows)
+    has_default_caller = any(
+        getattr(row, "is_default_caller_id", False)
+        for row in existing_rows
+        if getattr(row, "is_active", True)
+    )
     imported = 0
     skipped = 0
     deactivated = 0
+    discovered: set[str] = set()
 
     config_row = await db_client.get_telephony_configuration(config_id)
     provider_name = config_row.provider if config_row else None
@@ -80,18 +85,29 @@ async def sync_available_phone_numbers_for_config(
             )
             continue
 
+        discovered.add(normalized)
         extra_metadata = item.get("extra_metadata") or {}
 
         if normalized in existing_map:
             existing_row = existing_map[normalized]
-            if existing_row and extra_metadata:
-                merged = {**(existing_row.extra_metadata or {}), **extra_metadata}
-                if merged != existing_row.extra_metadata:
+            if existing_row:
+                updates: dict[str, Any] = {}
+                if not getattr(existing_row, "is_active", True):
+                    updates["is_active"] = True
+                if extra_metadata:
+                    merged = {**(existing_row.extra_metadata or {}), **extra_metadata}
+                    if merged != existing_row.extra_metadata:
+                        updates["extra_metadata"] = merged
+                if updates:
                     await db_client.update_phone_number(
                         phone_number_id=existing_row.id,
                         telephony_configuration_id=config_id,
-                        extra_metadata=merged,
+                        **updates,
                     )
+                    if updates.get("is_active"):
+                        logger.info(
+                            f"Reactivated returned phone number {normalized!r} for config {config_id}"
+                        )
             continue
 
         try:
@@ -127,24 +143,29 @@ async def sync_available_phone_numbers_for_config(
                 "already registered on another inbound route"
             )
 
-    # Issue 1: deactivate rows that are no longer present in the provider result.
-    discovered = {
-        normalize_telephony_address(item["address"]).canonical
-        for item in records
-        if item.get("address")
-    }
-    for row in existing_rows:
-        if row.is_active and row.address_normalized and row.address_normalized not in discovered:
-            await db_client.update_phone_number(
-                phone_number_id=row.id,
-                telephony_configuration_id=config_id,
-                is_active=False,
-            )
-            deactivated += 1
-            logger.info(
-                f"Deactivated stale phone number {row.address_normalized!r} for config {config_id}: "
-                "no longer present in provider result"
-            )
+    # Deactivate rows that are no longer present in the provider result, but only if
+    # the provider performed an account-wide inventory. Avoid deactivating valid numbers
+    # if discovery only returned a partial result (e.g. single directly queried number).
+    is_full_inventory = getattr(provider, "is_full_inventory", True)
+    if is_full_inventory:
+        for row in existing_rows:
+            if getattr(row, "is_active", True) and getattr(row, "address_normalized", None) and row.address_normalized not in discovered:
+                updates = {"is_active": False}
+                if getattr(row, "is_default_caller_id", False):
+                    updates["is_default_caller_id"] = False
+                row_id = getattr(row, "id", None)
+                if not row_id:
+                    continue
+                await db_client.update_phone_number(
+                    phone_number_id=row_id,
+                    telephony_configuration_id=config_id,
+                    **updates,
+                )
+                deactivated += 1
+                logger.info(
+                    f"Deactivated stale phone number {row.address_normalized!r} for config {config_id}: "
+                    "no longer present in provider result"
+                )
 
     if imported or deactivated:
         parts = []

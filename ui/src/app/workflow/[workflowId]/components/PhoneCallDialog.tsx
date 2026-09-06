@@ -257,11 +257,7 @@ export const PhoneCallDialog = ({
     );
     const needsPhoneService =
         needsConfiguration === true ||
-        (hasNonWhatsAppPendingOutbound &&
-            !telephonyConfigs.some(isCallable) &&
-            telephonyConfigs.some(
-                (config) => !config.inactive && config.is_ready_for_outbound === false,
-            ));
+        (hasNonWhatsAppPendingOutbound && !telephonyConfigs.some(isCallable));
 
     const goToConfiguration = (target?: { configId?: number; add?: boolean }) => {
         onOpenChange(false);

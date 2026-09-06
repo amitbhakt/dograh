@@ -243,15 +243,16 @@ class TelephonyConfigurationClient(BaseDBClient):
             )
             result_phone = await session.execute(stmt_phone)
             rows_phone = result_phone.scalars().all()
-            if len(rows_phone) > 1:
-                ids = ", ".join(str(r.id) for r in rows_phone)
+            unique_configs = {r.id: r for r in rows_phone}
+            if len(unique_configs) > 1:
+                ids = ", ".join(str(cid) for cid in unique_configs.keys())
                 logger.error(
                     f"[WhatsApp] Ambiguous phone_number_id={phone_number_id!r} via extra_metadata: "
-                    f"matches {len(rows_phone)} active configurations ({ids}). "
+                    f"matches {len(unique_configs)} active configurations ({ids}). "
                     f"Rejecting inbound call."
                 )
                 return None
-            return rows_phone[0] if rows_phone else None
+            return next(iter(unique_configs.values())) if unique_configs else None
 
     async def get_whatsapp_configuration_by_verify_token(
         self, verify_token: str

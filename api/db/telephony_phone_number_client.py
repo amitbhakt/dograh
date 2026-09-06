@@ -260,6 +260,8 @@ class TelephonyPhoneNumberClient(BaseDBClient):
                     TelephonyPhoneNumberModel.address_normalized.in_(
                         list(addresses_normalized)
                     ),
+                    TelephonyPhoneNumberModel.is_active.is_(True),
+                    TelephonyConfigurationModel.inactive.is_(False),
                 )
             )
             if exclude_configuration_id is not None:
@@ -319,6 +321,7 @@ class TelephonyPhoneNumberClient(BaseDBClient):
         inbound_workflow_id: Optional[int] = None,
         telephony_trunk_id: Optional[int] = None,
         is_active: Optional[bool] = None,
+        is_default_caller_id: Optional[bool] = None,
         country_code: Optional[str] = None,
         extra_metadata: Optional[Dict[str, Any]] = None,
         clear_inbound_workflow: bool = False,
@@ -344,6 +347,8 @@ class TelephonyPhoneNumberClient(BaseDBClient):
                 row.telephony_trunk_id = None
             if is_active is not None:
                 row.is_active = is_active
+            if is_default_caller_id is not None:
+                row.is_default_caller_id = is_default_caller_id
             if country_code is not None:
                 row.country_code = country_code
             if extra_metadata is not None:

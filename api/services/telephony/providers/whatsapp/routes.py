@@ -60,7 +60,8 @@ WHATSAPP_CALL_KEY_PREFIX = "whatsapp:call:"
 
 # Active in-memory registry of ongoing WhatsApp WebRTC calls on this worker:
 # call_id -> (SmallWebRTCConnection, workflow_run_id, organization_id, phone_number_id)
-_active_connections: Dict[str, Tuple[SmallWebRTCConnection, int, int]] = {}
+_active_connections: Dict[str, Tuple[SmallWebRTCConnection, int, int, str]] = {}
+_background_tasks: set[asyncio.Task] = set()
 
 # Reusable aiohttp session and cached clients per phone_number_id
 _http_session: Optional[aiohttp.ClientSession] = None
@@ -89,41 +90,56 @@ def _ensure_redis_subscriber() -> None:
 
 async def _listen_for_remote_terminates() -> None:
     """Listen for cross-worker terminate events on Redis pub/sub and disconnect local peer."""
-    try:
-        redis = aioredis.from_url(REDIS_URL, decode_responses=True)
-        pubsub = redis.pubsub()
-        await pubsub.subscribe(REDIS_TERMINATE_CHANNEL)
-        async for message in pubsub.listen():
-            if message.get("type") != "message":
-                continue
-            try:
-                data = json.loads(message["data"])
-                target_call_id = data.get("call_id")
-                if target_call_id and target_call_id in _active_connections:
-                    entry = _active_connections.pop(target_call_id, None)
-                    if entry:
-                        conn = entry[0]
-                        try:
-                            await conn.disconnect()
-                            logger.info(
-                                f"[WhatsApp] Peer connection closed via cross-worker terminate for {target_call_id}"
-                            )
-                        except Exception as e:
-                            logger.warning(
-                                f"[WhatsApp] Error during cross-worker peer disconnect: {e}"
-                            )
-            except Exception as e:
-                logger.warning(f"[WhatsApp] Error handling cross-worker terminate message: {e}")
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        logger.warning(f"[WhatsApp] Redis terminate subscriber stopped: {e}")
+    while True:
+        try:
+            redis = aioredis.from_url(REDIS_URL, decode_responses=True)
+            pubsub = redis.pubsub()
+            await pubsub.subscribe(REDIS_TERMINATE_CHANNEL)
+            async for message in pubsub.listen():
+                if message.get("type") != "message":
+                    continue
+                try:
+                    data = json.loads(message["data"])
+                    target_call_id = data.get("call_id")
+                    if target_call_id and target_call_id in _active_connections:
+                        entry = _active_connections.pop(target_call_id, None)
+                        if entry:
+                            conn = entry[0]
+                            try:
+                                await conn.disconnect()
+                                logger.info(
+                                    f"[WhatsApp] Peer connection closed via cross-worker terminate for {target_call_id}"
+                                )
+                            except Exception as e:
+                                logger.warning(
+                                    f"[WhatsApp] Error during cross-worker peer disconnect: {e}"
+                                )
+                except Exception as e:
+                    logger.warning(f"[WhatsApp] Error handling cross-worker terminate message: {e}")
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning(
+                f"[WhatsApp] Redis terminate subscriber error: {e}, reconnecting in 5s..."
+            )
+            await asyncio.sleep(5)
 
 
 def _get_http_session() -> aiohttp.ClientSession:
     """Return a shared aiohttp client session for Meta API requests."""
     global _http_session
-    if _http_session is None or _http_session.closed:
+    loop = None
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        pass
+
+    session_loop = getattr(_http_session, "_loop", None) if _http_session else None
+    if (
+        _http_session is None
+        or _http_session.closed
+        or (loop and session_loop and session_loop != loop)
+    ):
         _http_session = aiohttp.ClientSession()
     return _http_session
 
@@ -230,13 +246,6 @@ async def handle_webhook_verification(
             return PlainTextResponse(hub_challenge, status_code=200)
     except Exception as e:
         logger.warning(f"[WhatsApp] Error during DB verify token lookup: {e}")
-
-    if not WHATSAPP_WEBHOOK_VERIFY_TOKEN:
-        logger.error("[WhatsApp] Webhook verification token is not configured")
-        raise HTTPException(
-            status_code=500,
-            detail="Webhook verification token is not configured",
-        )
 
     logger.warning("[WhatsApp] Webhook verification failed: token mismatch")
     raise HTTPException(status_code=403, detail="Invalid verification token")
@@ -477,10 +486,31 @@ async def _handle_inbound_call_connect(
             phone_row = p
             break
 
+    # Fallback: only when destination to_number was omitted/empty in the incoming webhook,
+    # resolve by matching phone_number_id in extra_metadata or single active phone row
+    if not phone_row and not normalized_to:
+        if phone_number_id:
+            for p in phones:
+                if not getattr(p, "is_active", True):
+                    continue
+                meta = getattr(p, "extra_metadata", {}) or {}
+                if str(meta.get("phone_number_id") or meta.get("meta_phone_number_id") or "") == str(phone_number_id):
+                    phone_row = p
+                    break
+
+        if not phone_row:
+            active_phones = [p for p in phones if getattr(p, "is_active", True)]
+            if len(active_phones) == 1:
+                phone_row = active_phones[0]
+
+        if phone_row:
+            normalized_to = phone_row.address_normalized
+
     if not phone_row:
         logger.warning(
             f"[WhatsApp] No active configured phone number found matching destination "
-            f"{normalized_to} for config {config.id}. Rejecting call {call_id}."
+            f"{normalized_to} (or phone_number_id {phone_number_id}) for config {config.id}. "
+            f"Rejecting call {call_id}."
         )
         await _reject_whatsapp_call(phone_number_id, call_id, access_token)
         return
@@ -625,7 +655,7 @@ async def _handle_inbound_call_connect(
         _ensure_redis_subscriber()
 
         # Launch the voice pipeline asynchronously so the webhook responds immediately
-        asyncio.create_task(
+        pipeline_task = asyncio.create_task(
             _run_whatsapp_pipeline(
                 connection=connection,
                 workflow_id=workflow_id,
@@ -635,6 +665,8 @@ async def _handle_inbound_call_connect(
                 call_id=call.id,
             )
         )
+        _background_tasks.add(pipeline_task)
+        pipeline_task.add_done_callback(_background_tasks.discard)
 
     try:
         parsed_request = WhatsAppWebhookRequest.model_validate(payload)
@@ -684,13 +716,14 @@ async def _run_whatsapp_pipeline(
             f"[WhatsApp] Pipeline error for workflow_run {workflow_run_id}: {e}",
             exc_info=True,
         )
-        # Only mark failed if terminate handler has not already finalized the run
         try:
-            existing = await db_client.get_workflow_run_by_id(workflow_run_id)
-            if existing and not existing.is_completed:
-                await mark_workflow_run_failed(workflow_run_id, str(e))
-        except Exception:
-            await mark_workflow_run_failed(workflow_run_id, str(e))
+            await mark_workflow_run_failed(
+                workflow_run_id, str(e), only_if_incomplete=True
+            )
+        except Exception as mark_err:
+            logger.warning(
+                f"[WhatsApp] Failed to mark workflow run {workflow_run_id} failed: {mark_err}"
+            )
     finally:
         _active_connections.pop(call_id, None)
         try:

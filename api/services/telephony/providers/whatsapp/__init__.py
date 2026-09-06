@@ -90,7 +90,6 @@ _UI_METADATA = ProviderUIMetadata(
             name="webhook_verify_token",
             label="Webhook Verify Token",
             type="text",
-            sensitive=True,
             section="Webhook Configuration",
             description="Paste this into Meta alongside Callback URL, click Verify and Save, and subscribe to the 'calls' field."
         ),
