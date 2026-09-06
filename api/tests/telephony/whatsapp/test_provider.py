@@ -512,3 +512,83 @@ class TestWhatsAppProvider(IsolatedAsyncioTestCase):
             self.assertEqual(transport._params.audio_in_sample_rate, 16000)
             self.assertEqual(transport._params.audio_out_sample_rate, 16000)
 
+
+class TestWhatsAppConfigurationDisplayAndMerge(IsolatedAsyncioTestCase):
+    """Test credential masking and edit-merge preservation for WhatsApp configurations."""
+
+    def setUp(self):
+        from api.routes.organization import _credentials_for_display, preserve_masked_fields
+        self._credentials_for_display = _credentials_for_display
+        self.preserve_masked_fields = preserve_masked_fields
+
+        self.stored = {
+            "provider": "whatsapp",
+            "phone_number_id": "106540352242922",
+            "access_token": "secret_access_token_value",
+            "app_secret": "secret_app_secret_value",
+            "webhook_verify_token": "secret_verify_token_value",
+            "business_initiated_calls_enabled": True,
+            "call_icon_visibility": "business_hours",
+        }
+
+    def test_credentials_for_display_masks_secrets_without_dropping_them(self):
+        """Display credentials must include access_token and app_secret in masked form."""
+        displayed = self._credentials_for_display("whatsapp", self.stored)
+
+        self.assertEqual(displayed["provider"], "whatsapp")
+        self.assertEqual(displayed["phone_number_id"], "106540352242922")
+        self.assertTrue(displayed["business_initiated_calls_enabled"])
+        self.assertEqual(displayed["call_icon_visibility"], "business_hours")
+
+        # Secrets must be present and masked (not equal to original secret)
+        self.assertIn("access_token", displayed)
+        self.assertIn("app_secret", displayed)
+        self.assertIn("webhook_verify_token", displayed)
+        self.assertNotEqual(displayed["access_token"], "secret_access_token_value")
+        self.assertNotEqual(displayed["app_secret"], "secret_app_secret_value")
+        self.assertNotEqual(displayed["webhook_verify_token"], "secret_verify_token_value")
+
+    def test_preserve_masked_fields_restores_stored_secrets_when_masked(self):
+        """When UI submits masked secrets back, stored unmasked values are restored."""
+        displayed = self._credentials_for_display("whatsapp", self.stored)
+        request_dict = dict(displayed)
+
+        self.preserve_masked_fields("whatsapp", request_dict, self.stored)
+
+        self.assertEqual(request_dict["access_token"], "secret_access_token_value")
+        self.assertEqual(request_dict["app_secret"], "secret_app_secret_value")
+        self.assertEqual(request_dict["webhook_verify_token"], "secret_verify_token_value")
+
+    def test_preserve_masked_fields_restores_stored_secrets_when_omitted_or_empty(self):
+        """When UI or client omits secrets or submits empty string on update, stored values are preserved."""
+        request_dict = {
+            "provider": "whatsapp",
+            "phone_number_id": "106540352242922",
+            "access_token": None,
+            "app_secret": "",
+            "webhook_verify_token": None,
+        }
+
+        self.preserve_masked_fields("whatsapp", request_dict, self.stored)
+
+        self.assertEqual(request_dict["access_token"], "secret_access_token_value")
+        self.assertEqual(request_dict["app_secret"], "secret_app_secret_value")
+        self.assertEqual(request_dict["webhook_verify_token"], "secret_verify_token_value")
+
+    def test_preserve_masked_fields_accepts_new_secrets_when_updated(self):
+        """When user provides a new real secret, it is not overwritten by existing value."""
+        request_dict = {
+            "provider": "whatsapp",
+            "phone_number_id": "106540352242922",
+            "access_token": "new_rotated_access_token",
+            "app_secret": "new_rotated_app_secret",
+            "webhook_verify_token": "new_rotated_verify_token",
+        }
+
+        self.preserve_masked_fields("whatsapp", request_dict, self.stored)
+
+        self.assertEqual(request_dict["access_token"], "new_rotated_access_token")
+        self.assertEqual(request_dict["app_secret"], "new_rotated_app_secret")
+        self.assertEqual(request_dict["webhook_verify_token"], "new_rotated_verify_token")
+
+

@@ -652,11 +652,11 @@ async def get_model_configuration_preferences_legacy(
 
 
 def preserve_masked_fields(provider: str, request_dict: dict, existing: dict):
-    """If the client re-submitted a masked sensitive field, restore the original."""
+    """If the client re-submitted a masked sensitive field or omitted it on update, restore the original."""
     for field_name in _sensitive_fields(provider):
         v = _get_nested_field(request_dict, field_name)
         existing_value = _get_nested_field(existing, field_name)
-        if v and is_mask_of(v, existing_value or ""):
+        if existing_value and (v is None or v == "" or is_mask_of(v, existing_value)):
             _set_nested_field(request_dict, field_name, existing_value)
 
 
@@ -894,6 +894,16 @@ async def create_telephony_configuration(
         raise HTTPException(status_code=400, detail="No organization selected")
 
     credentials = _credentials_from_payload(request.config)
+    if request.config.provider == "whatsapp":
+        missing = [
+            f for f in ("access_token", "app_secret", "webhook_verify_token")
+            if not credentials.get(f)
+        ]
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail=f"Missing required WhatsApp credentials: {', '.join(missing)}",
+            )
     credentials = await _run_preprocess_hook(request.config.provider, credentials)
 
     try:
