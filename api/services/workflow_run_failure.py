@@ -53,7 +53,7 @@ async def mark_workflow_run_failed(
             await db_client.get_organization_id_by_workflow_run_id(workflow_run_id),
             error_disposition,
         )
-        await db_client.update_workflow_run(
+        updated_run = await db_client.update_workflow_run(
             run_id=workflow_run_id,
             is_completed=True,
             state=WorkflowRunState.COMPLETED.value,
@@ -69,6 +69,11 @@ async def mark_workflow_run_failed(
             logs={"realtime_feedback_events": [failure_event]},
             only_if_incomplete=only_if_incomplete,
         )
+        if only_if_incomplete and updated_run is None:
+            logger.info(
+                f"Workflow run {workflow_run_id} was already completed; skipping failure enqueue"
+            )
+            return
     except Exception as e:  # noqa: BLE001 - bookkeeping must remain best-effort
         logger.error(f"Failed to record failure on workflow run {workflow_run_id}: {e}")
         return

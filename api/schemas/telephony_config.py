@@ -36,6 +36,7 @@ from api.services.telephony.providers.vonage.config import (
 )
 from api.services.telephony.providers.whatsapp.config import (
     WhatsAppConfigurationRequest,
+    WhatsAppConfigurationResponse,
 )
 from api.services.telephony.registry import (
     ProviderConnectivity,
@@ -193,4 +194,5 @@ __all__ = [
     "VobizConfigurationRequest",
     "VonageConfigurationRequest",
     "WhatsAppConfigurationRequest",
+    "WhatsAppConfigurationResponse",
 ]

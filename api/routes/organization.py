@@ -149,6 +149,17 @@ def _credentials_for_display(provider_name: str, value: dict) -> dict:
     if spec:
         for field_name in spec.server_managed_credential_fields:
             out.pop(field_name, None)
+        if spec.config_response_cls:
+            try:
+                payload = dict(out)
+                if "provider" not in payload:
+                    payload["provider"] = provider_name
+                return spec.config_response_cls(**payload).model_dump()
+            except Exception as e:
+                logger.warning(
+                    f"Failed to build response via {spec.config_response_cls.__name__} "
+                    f"for provider {provider_name}: {e}"
+                )
     return out
 
 

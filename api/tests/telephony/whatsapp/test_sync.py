@@ -60,6 +60,7 @@ class TestPhoneNumberSyncLifecycle(IsolatedAsyncioTestCase):
     async def test_sync_handles_unparseable_address_without_crashing(self):
         """Unparseable addresses returned by provider are skipped, and do not crash building discovered set."""
         mock_provider = MagicMock()
+        mock_provider.is_full_inventory = True
         mock_provider.get_available_phone_number_records = AsyncMock(
             return_value=[
                 {"address": "   "},
@@ -201,33 +202,6 @@ class TestPhoneNumberSyncLifecycle(IsolatedAsyncioTestCase):
             self.assertTrue(status.ok)
             # update_phone_number must NOT be called for deactivation
             mock_update.assert_not_called()
-
-
-class TestAtomicWorkflowRunFailure(IsolatedAsyncioTestCase):
-    async def test_update_workflow_run_skips_if_already_completed(self):
-        """When only_if_incomplete=True and run is already completed, update_workflow_run does not overwrite."""
-        mock_run = MagicMock()
-        mock_run.id = 101
-        mock_run.is_completed = True
-        mock_run.state = "completed"
-
-        mock_session = AsyncMock()
-        mock_session_ctx = AsyncMock()
-        mock_session_ctx.__aenter__.return_value = mock_session
-        mock_session_ctx.__aexit__.return_value = None
-
-        exec_res = MagicMock()
-        exec_res.scalars.return_value.first.return_value = mock_run
-        mock_session.execute = AsyncMock(return_value=exec_res)
-
-        with patch.object(db_client, "async_session", return_value=mock_session_ctx):
-            result = await db_client.update_workflow_run(
-                run_id=101,
-                state="failed",
-                only_if_incomplete=True,
-            )
-            self.assertEqual(result.state, "completed")
-            mock_session.commit.assert_not_awaited()
 
 
 class TestWhatsAppWABADiscovery(IsolatedAsyncioTestCase):

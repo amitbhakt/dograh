@@ -91,6 +91,8 @@ def _ensure_redis_subscriber() -> None:
 async def _listen_for_remote_terminates() -> None:
     """Listen for cross-worker terminate events on Redis pub/sub and disconnect local peer."""
     while True:
+        redis = None
+        pubsub = None
         try:
             redis = aioredis.from_url(REDIS_URL, decode_responses=True)
             pubsub = redis.pubsub()
@@ -122,12 +124,29 @@ async def _listen_for_remote_terminates() -> None:
             logger.warning(
                 f"[WhatsApp] Redis terminate subscriber error: {e}, reconnecting in 5s..."
             )
+        finally:
+            if pubsub:
+                try:
+                    if hasattr(pubsub, "aclose"):
+                        await pubsub.aclose()
+                    else:
+                        await pubsub.close()
+                except Exception:
+                    pass
+            if redis:
+                try:
+                    await redis.aclose()
+                except Exception:
+                    pass
+        try:
             await asyncio.sleep(5)
+        except asyncio.CancelledError:
+            break
 
 
 def _get_http_session() -> aiohttp.ClientSession:
     """Return a shared aiohttp client session for Meta API requests."""
-    global _http_session
+    global _http_session, _clients
     loop = None
     try:
         loop = asyncio.get_running_loop()
@@ -140,6 +159,15 @@ def _get_http_session() -> aiohttp.ClientSession:
         or _http_session.closed
         or (loop and session_loop and session_loop != loop)
     ):
+        if _http_session and not _http_session.closed:
+            try:
+                if session_loop and session_loop.is_running():
+                    session_loop.create_task(_http_session.close())
+                elif loop and loop.is_running():
+                    loop.create_task(_http_session.close())
+            except Exception:
+                pass
+        _clients.clear()
         _http_session = aiohttp.ClientSession()
     return _http_session
 

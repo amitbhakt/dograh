@@ -683,43 +683,55 @@ class WhatsAppProvider(TelephonyProvider):
             #   itself a WABA ID), query {self.phone_number_id}/phone_numbers.
             target_waba = waba_id or (self.phone_number_id if not records else None)
             if target_waba:
-                waba_endpoint = f"{self.GRAPH_API_BASE_URL}/{target_waba}/phone_numbers"
-                try:
-                    async with session.get(waba_endpoint, headers=headers) as response:
-                        if response.status == 200:
-                            self.is_full_inventory = True
-                            payload = await response.json()
-                            for record in payload.get("data") or []:
-                                display_phone_number = record.get("display_phone_number")
-                                phone_id = record.get("id")
-                                if not display_phone_number:
-                                    continue
-                                try:
-                                    canonical = normalize_telephony_address(
-                                        display_phone_number
-                                    ).canonical
-                                    if canonical not in seen_addresses:
-                                        seen_addresses.add(canonical)
-                                        records.append({
-                                            "address": canonical,
-                                            "extra_metadata": {
-                                                "meta_phone_number_id": str(phone_id or target_waba),
-                                                "phone_number_id": str(phone_id or target_waba),
-                                            },
-                                        })
-                                except ValueError:
-                                    logger.warning(
-                                        "Skipping unparseable WhatsApp phone number "
-                                        f"{display_phone_number!r}"
-                                    )
-                        else:
-                            error_text = await response.text()
-                            logger.warning(
-                                f"Query on /phone_numbers edge for ID {target_waba} "
-                                f"returned {response.status}: {error_text}"
-                            )
-                except Exception as e:
-                    logger.warning(f"Error querying /phone_numbers edge: {e}")
+                next_url: Optional[str] = f"{self.GRAPH_API_BASE_URL}/{target_waba}/phone_numbers"
+                all_pages_succeeded = True
+                had_successful_page = False
+                while next_url:
+                    try:
+                        async with session.get(next_url, headers=headers) as response:
+                            if response.status == 200:
+                                had_successful_page = True
+                                payload = await response.json()
+                                for record in payload.get("data") or []:
+                                    display_phone_number = record.get("display_phone_number")
+                                    phone_id = record.get("id")
+                                    if not display_phone_number:
+                                        continue
+                                    try:
+                                        canonical = normalize_telephony_address(
+                                            display_phone_number
+                                        ).canonical
+                                        if canonical not in seen_addresses:
+                                            seen_addresses.add(canonical)
+                                            records.append({
+                                                "address": canonical,
+                                                "extra_metadata": {
+                                                    "meta_phone_number_id": str(phone_id or target_waba),
+                                                    "phone_number_id": str(phone_id or target_waba),
+                                                },
+                                            })
+                                    except ValueError:
+                                        logger.warning(
+                                            "Skipping unparseable WhatsApp phone number "
+                                            f"{display_phone_number!r}"
+                                        )
+                                paging = payload.get("paging") or {}
+                                next_url = paging.get("next")
+                            else:
+                                error_text = await response.text()
+                                logger.warning(
+                                    f"Query on /phone_numbers edge for ID {target_waba} "
+                                    f"returned {response.status}: {error_text}"
+                                )
+                                all_pages_succeeded = False
+                                break
+                    except Exception as e:
+                        logger.warning(f"Error querying /phone_numbers edge: {e}")
+                        all_pages_succeeded = False
+                        break
+
+                if all_pages_succeeded and had_successful_page:
+                    self.is_full_inventory = True
 
         # 3. Fallback to statically configured from_numbers if any
         if not records and self.from_numbers:

@@ -260,8 +260,6 @@ class TelephonyPhoneNumberClient(BaseDBClient):
                     TelephonyPhoneNumberModel.address_normalized.in_(
                         list(addresses_normalized)
                     ),
-                    TelephonyPhoneNumberModel.is_active.is_(True),
-                    TelephonyConfigurationModel.inactive.is_(False),
                 )
             )
             if exclude_configuration_id is not None:
