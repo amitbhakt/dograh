@@ -651,12 +651,52 @@ async def get_model_configuration_preferences_legacy(
     return await get_preferences(user=user)
 
 
-def preserve_masked_fields(provider: str, request_dict: dict, existing: dict):
-    """If the client re-submitted a masked sensitive field, restore the original."""
+def _has_nested_field(value: dict, dotted_path: str) -> bool:
+    current = value
+    for part in dotted_path.split("."):
+        if not isinstance(current, dict) or part not in current:
+            return False
+        current = current[part]
+    return True
+
+
+def _get_model_fields_set_paths(model: Any, prefix: str = "") -> set[str]:
+    """Recursively collect dotted field paths that were explicitly set on a Pydantic model."""
+    if not hasattr(model, "model_fields_set"):
+        return set()
+    paths = set()
+    for field in model.model_fields_set:
+        full_path = f"{prefix}.{field}" if prefix else field
+        paths.add(full_path)
+        val = getattr(model, field, None)
+        if hasattr(val, "model_fields_set"):
+            paths.update(_get_model_fields_set_paths(val, prefix=full_path))
+    return paths
+
+
+def preserve_masked_fields(
+    provider: str,
+    request_dict: dict,
+    existing: dict,
+    fields_set: set[str] | None = None,
+):
+    """If the client re-submitted a masked sensitive field or omitted it on update, restore the original.
+
+    Preserves omitted fields from stored configuration while allowing explicit
+    null/empty clears.
+    """
     for field_name in _sensitive_fields(provider):
         v = _get_nested_field(request_dict, field_name)
         existing_value = _get_nested_field(existing, field_name)
-        if v and is_mask_of(v, existing_value or ""):
+        if not existing_value:
+            continue
+
+        if fields_set is not None:
+            is_omitted = field_name not in fields_set
+        else:
+            is_omitted = not _has_nested_field(request_dict, field_name)
+
+        if is_omitted or (v and is_mask_of(v, existing_value)):
             _set_nested_field(request_dict, field_name, existing_value)
 
 
@@ -982,8 +1022,12 @@ async def update_telephony_configuration(
                 detail="Provider cannot be changed; create a new configuration instead.",
             )
         credentials = _credentials_from_payload(request.config)
+        fields_set = _get_model_fields_set_paths(request.config)
         preserve_masked_fields(
-            existing.provider, credentials, existing.credentials or {}
+            existing.provider,
+            credentials,
+            existing.credentials or {},
+            fields_set=fields_set,
         )
         credentials = await _run_preprocess_hook(
             existing.provider,

@@ -617,4 +617,61 @@ class TestWhatsAppConfigurationDisplayAndMerge(IsolatedAsyncioTestCase):
         self.assertEqual(req_dict["access_token"], "secret_access_token_value")
         self.assertEqual(req_dict["app_secret"], "secret_app_secret_value")
 
+    def test_preserve_masked_fields_preserves_omitted_secrets_on_partial_update(self):
+        """When an update omits an optional sensitive field, stored value is preserved."""
+        from api.routes.organization import _get_model_fields_set_paths
+        from api.services.configuration.masking import mask_key
+        from api.services.telephony.providers.vonage.config import VonageConfigurationRequest
+
+        stored_vonage = {
+            "api_key": "k1",
+            "api_secret": "secret_key_12345",
+            "application_id": "app1",
+            "private_key": "private_key_data_here",
+            "signature_secret": "existing_sig_secret",
+        }
+        # Update payload omits signature_secret
+        req = VonageConfigurationRequest.model_validate({
+            "api_key": "k1",
+            "api_secret": mask_key(stored_vonage["api_secret"]),
+            "application_id": "app1",
+            "private_key": mask_key(stored_vonage["private_key"]),
+        })
+        fields_set = _get_model_fields_set_paths(req)
+        request_dict = req.model_dump()
+        self.assertNotIn("signature_secret", fields_set)
+        self.assertIsNone(request_dict["signature_secret"])
+
+        self.preserve_masked_fields("vonage", request_dict, stored_vonage, fields_set=fields_set)
+        self.assertEqual(request_dict["signature_secret"], "existing_sig_secret")
+        self.assertEqual(request_dict["api_secret"], "secret_key_12345")
+
+    def test_preserve_masked_fields_allows_explicit_null_clearing_with_fields_set(self):
+        """When signature_secret is explicitly set to None, it is not restored."""
+        from api.routes.organization import _get_model_fields_set_paths
+        from api.services.configuration.masking import mask_key
+        from api.services.telephony.providers.vonage.config import VonageConfigurationRequest
+
+        stored_vonage = {
+            "api_key": "k1",
+            "api_secret": "secret_key_12345",
+            "application_id": "app1",
+            "private_key": "private_key_data_here",
+            "signature_secret": "existing_sig_secret",
+        }
+        req = VonageConfigurationRequest.model_validate({
+            "api_key": "k1",
+            "api_secret": mask_key(stored_vonage["api_secret"]),
+            "application_id": "app1",
+            "private_key": mask_key(stored_vonage["private_key"]),
+            "signature_secret": None,
+        })
+        fields_set = _get_model_fields_set_paths(req)
+        request_dict = req.model_dump()
+        self.assertIn("signature_secret", fields_set)
+
+        self.preserve_masked_fields("vonage", request_dict, stored_vonage, fields_set=fields_set)
+        self.assertIsNone(request_dict["signature_secret"])
+        self.assertEqual(request_dict["api_secret"], "secret_key_12345")
+
 
