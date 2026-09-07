@@ -564,6 +564,13 @@ class TestWhatsAppConfigurationDisplayAndMerge(IsolatedAsyncioTestCase):
         self.assertEqual(request_dict["app_secret"], "secret_app_secret_value")
         self.assertEqual(request_dict["webhook_verify_token"], "secret_verify_token_value")
 
+        # The round-trip has to carry the non-sensitive settings too. The save
+        # path replaces credentials wholesale, so a flag that GET drops (or that
+        # the response schema stops declaring) would come back as the request
+        # schema's default and silently overwrite what is stored.
+        self.assertIs(request_dict["business_initiated_calls_enabled"], True)
+        self.assertEqual(request_dict["call_icon_visibility"], "business_hours")
+
     def test_preserve_masked_fields_accepts_new_secrets_when_updated(self):
         """When user provides a new real secret, it is not overwritten by existing value."""
         from api.routes.organization import _get_model_fields_set_paths
