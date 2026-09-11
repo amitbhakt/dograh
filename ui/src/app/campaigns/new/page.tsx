@@ -30,6 +30,7 @@ import { useAuth } from '@/lib/auth';
 
 import CampaignAdvancedSettings, { getTimezoneValue, type TimeSlot } from '../CampaignAdvancedSettings';
 import CsvUploadSelector from '../CsvUploadSelector';
+import { WhatsAppPermissionCard } from '../WhatsAppPermissionCard';
 
 export default function NewCampaignPage() {
     const { user, getAccessToken, redirectToLogin, loading } = useAuth();
@@ -82,6 +83,7 @@ export default function NewCampaignPage() {
     const [circuitBreakerFailureThreshold, setCircuitBreakerFailureThreshold] = useState<string>('50');
     const [circuitBreakerWindowSeconds, setCircuitBreakerWindowSeconds] = useState<string>('120');
     const [circuitBreakerMinCalls, setCircuitBreakerMinCalls] = useState<string>('5');
+    const [whatsappPermissionAction, setWhatsappPermissionAction] = useState<string>('skip');
 
     // Redirect if not authenticated
     useEffect(() => {
@@ -234,6 +236,8 @@ export default function NewCampaignPage() {
         ? Math.min(orgConcurrentLimit, availableFromNumbersCount)
         : orgConcurrentLimit;
 
+    const isWhatsApp = selectedTelephonyConfig?.provider === 'whatsapp';
+
     // Handle form submission
     const handleSubmit = async (e: React.FormEvent) => {
         e.preventDefault();
@@ -305,7 +309,8 @@ export default function NewCampaignPage() {
                     max_concurrency: maxConcurrencyValue,
                     schedule_config: scheduleConfig,
                     circuit_breaker: circuitBreakerConfig,
-                },
+                    whatsapp_permission_action: isWhatsApp ? whatsappPermissionAction : 'skip',
+                } as any,
                 headers: {
                     'Authorization': `Bearer ${accessToken}`,
                 }
@@ -467,6 +472,13 @@ export default function NewCampaignPage() {
                                 </p>
                             </div>
 
+                            {selectedTelephonyConfig?.provider === 'whatsapp' && (
+                                <WhatsAppPermissionCard
+                                    value={whatsappPermissionAction}
+                                    onChange={setWhatsappPermissionAction}
+                                />
+                            )}
+
                             <div className="space-y-2">
                                 <Label htmlFor="source-type">Data Source Type</Label>
                                 <Select
@@ -515,7 +527,7 @@ export default function NewCampaignPage() {
                                         onMaxConcurrencyChange={setMaxConcurrency}
                                         effectiveLimit={effectiveLimit}
                                         orgConcurrentLimit={orgConcurrentLimit}
-                                        fromNumbersCount={fromNumbersCount}
+                                        fromNumbersCount={availableFromNumbersCount}
                                         retryEnabled={retryEnabled}
                                         onRetryEnabledChange={setRetryEnabled}
                                         maxRetries={maxRetries}
@@ -542,6 +554,7 @@ export default function NewCampaignPage() {
                                         onCircuitBreakerWindowSecondsChange={setCircuitBreakerWindowSeconds}
                                         circuitBreakerMinCalls={circuitBreakerMinCalls}
                                         onCircuitBreakerMinCallsChange={setCircuitBreakerMinCalls}
+                                        isWhatsApp={selectedTelephonyConfig?.provider === 'whatsapp'}
                                     />
                                 </CollapsibleContent>
                             </Collapsible>

@@ -59,6 +59,7 @@ REDIS_SETTINGS = RedisSettings(
 
 from api.tasks.campaign_tasks import (
     process_campaign_batch,
+    sweep_parked_whatsapp_permissions,
     sync_campaign_source,
 )
 from api.tasks.knowledge_base_processing import process_knowledge_base_document
@@ -80,6 +81,7 @@ class WorkerSettings:
         process_knowledge_base_document,
         deliver_webhook,
         complete_inactive_text_chat_session,
+        sweep_parked_whatsapp_permissions,
     ]
     cron_jobs = [
         # Safety net for webhook deliveries whose ARQ job was lost (worker
@@ -96,6 +98,14 @@ class WorkerSettings:
             sweep_inactive_text_chat_sessions,
             minute=set(range(0, 60, TEXT_CHAT_INACTIVITY_SWEEP_INTERVAL_MINUTES)),
             second=30,
+            run_at_startup=True,
+        ),
+        # Check and reactivate parked WhatsApp leads across running campaigns when
+        # recipients grant call permission.
+        cron(
+            sweep_parked_whatsapp_permissions,
+            minute=set(range(0, 60, 2)),
+            second=15,
             run_at_startup=True,
         ),
     ]

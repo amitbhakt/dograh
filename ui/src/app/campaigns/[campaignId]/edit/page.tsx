@@ -9,9 +9,10 @@ import { toast } from 'sonner';
 import {
     getCampaignApiV1CampaignCampaignIdGet,
     getCampaignDefaultsApiV1OrganizationsCampaignDefaultsGet,
+    listTelephonyConfigurationsApiV1OrganizationsTelephonyConfigsGet,
     updateCampaignApiV1CampaignCampaignIdPatch
 } from '@/client/sdk.gen';
-import type { CampaignResponse } from '@/client/types.gen';
+import type { CampaignResponse, TelephonyConfigurationListItem } from '@/client/types.gen';
 import { Button } from '@/components/ui/button';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Input } from '@/components/ui/input';
@@ -20,6 +21,7 @@ import { Separator } from '@/components/ui/separator';
 import { useAuth } from '@/lib/auth';
 
 import CampaignAdvancedSettings, { getTimezoneValue, type TimeSlot } from '../../CampaignAdvancedSettings';
+import { WhatsAppPermissionCard } from '../../WhatsAppPermissionCard';
 
 export default function EditCampaignPage() {
     const { user, getAccessToken, redirectToLogin, loading } = useAuth();
@@ -40,6 +42,7 @@ export default function EditCampaignPage() {
     // Limits state
     const [orgConcurrentLimit, setOrgConcurrentLimit] = useState<number>(2);
     const [fromNumbersCount, setFromNumbersCount] = useState<number>(0);
+    const [telephonyConfigs, setTelephonyConfigs] = useState<TelephonyConfigurationListItem[]>([]);
 
     // Retry config state
     const [retryEnabled, setRetryEnabled] = useState(true);
@@ -60,6 +63,7 @@ export default function EditCampaignPage() {
     const [circuitBreakerFailureThreshold, setCircuitBreakerFailureThreshold] = useState<string>('50');
     const [circuitBreakerWindowSeconds, setCircuitBreakerWindowSeconds] = useState<string>('120');
     const [circuitBreakerMinCalls, setCircuitBreakerMinCalls] = useState<string>('5');
+    const [whatsappPermissionAction, setWhatsappPermissionAction] = useState<string>('skip');
 
     // Redirect if not authenticated
     useEffect(() => {
@@ -118,6 +122,10 @@ export default function EditCampaignPage() {
                     setCircuitBreakerWindowSeconds(String(cb.window_seconds));
                     setCircuitBreakerMinCalls(String(cb.min_calls_in_window));
                 }
+
+                if ((c as any).whatsapp_permission_action) {
+                    setWhatsappPermissionAction((c as any).whatsapp_permission_action);
+                }
             }
         } catch (error) {
             console.error('Failed to fetch campaign:', error);
@@ -128,18 +136,26 @@ export default function EditCampaignPage() {
         }
     }, [user, getAccessToken, campaignId, router]);
 
-    // Fetch campaign limits
+    // Fetch campaign limits & telephony configs
     const fetchCampaignDefaults = useCallback(async () => {
         if (!user) return;
         try {
             const accessToken = await getAccessToken();
-            const response = await getCampaignDefaultsApiV1OrganizationsCampaignDefaultsGet({
-                headers: { 'Authorization': `Bearer ${accessToken}` },
-            });
+            const [defaultsRes, configsRes] = await Promise.all([
+                getCampaignDefaultsApiV1OrganizationsCampaignDefaultsGet({
+                    headers: { 'Authorization': `Bearer ${accessToken}` },
+                }),
+                listTelephonyConfigurationsApiV1OrganizationsTelephonyConfigsGet({
+                    headers: { 'Authorization': `Bearer ${accessToken}` },
+                }),
+            ]);
 
-            if (response.data) {
-                setOrgConcurrentLimit(response.data.concurrent_call_limit);
-                setFromNumbersCount(response.data.from_numbers_count);
+            if (defaultsRes.data) {
+                setOrgConcurrentLimit(defaultsRes.data.concurrent_call_limit);
+                setFromNumbersCount(defaultsRes.data.from_numbers_count);
+            }
+            if (configsRes.data) {
+                setTelephonyConfigs(configsRes.data);
             }
         } catch (error) {
             console.error('Failed to fetch campaign limits:', error);
@@ -154,9 +170,19 @@ export default function EditCampaignPage() {
         }
     }, [fetchCampaign, fetchCampaignDefaults, user]);
 
+    const matchingConfig = telephonyConfigs.find(
+        (tc) => tc.id === campaign?.telephony_configuration_id
+    );
+    const isWhatsApp = Boolean(
+        matchingConfig?.provider === 'whatsapp' ||
+        campaign?.telephony_configuration_name?.toLowerCase().includes('whatsapp') ||
+        (campaign as any)?.whatsapp_permission_action !== undefined
+    );
+    const effectiveFromNumbers = isWhatsApp ? 1 : (matchingConfig?.phone_number_count ?? fromNumbersCount);
+
     // Effective concurrency limit
-    const effectiveLimit = fromNumbersCount > 0
-        ? Math.min(orgConcurrentLimit, fromNumbersCount)
+    const effectiveLimit = effectiveFromNumbers > 0
+        ? Math.min(orgConcurrentLimit, effectiveFromNumbers)
         : orgConcurrentLimit;
 
     // Handle form submission
@@ -243,7 +269,8 @@ export default function EditCampaignPage() {
                     max_concurrency: maxConcurrencyValue,
                     schedule_config: scheduleConfig,
                     circuit_breaker: circuitBreakerConfig,
-                },
+                    whatsapp_permission_action: isWhatsApp ? whatsappPermissionAction : undefined,
+                } as any,
                 headers: { 'Authorization': `Bearer ${accessToken}` },
             });
 
@@ -329,6 +356,14 @@ export default function EditCampaignPage() {
                             />
                         </div>
 
+                        {/* WhatsApp Permission Policy */}
+                        {isWhatsApp && (
+                            <WhatsAppPermissionCard
+                                value={whatsappPermissionAction as 'skip' | 'request_and_wait'}
+                                onChange={setWhatsappPermissionAction}
+                            />
+                        )}
+
                         <Separator />
 
                         <CampaignAdvancedSettings
@@ -336,7 +371,7 @@ export default function EditCampaignPage() {
                             onMaxConcurrencyChange={setMaxConcurrency}
                             effectiveLimit={effectiveLimit}
                             orgConcurrentLimit={orgConcurrentLimit}
-                            fromNumbersCount={fromNumbersCount}
+                            fromNumbersCount={effectiveFromNumbers}
                             retryEnabled={retryEnabled}
                             onRetryEnabledChange={setRetryEnabled}
                             maxRetries={maxRetries}
@@ -363,6 +398,7 @@ export default function EditCampaignPage() {
                             onCircuitBreakerWindowSecondsChange={setCircuitBreakerWindowSeconds}
                             circuitBreakerMinCalls={circuitBreakerMinCalls}
                             onCircuitBreakerMinCallsChange={setCircuitBreakerMinCalls}
+                            isWhatsApp={isWhatsApp}
                         />
 
                         {submitError && (

@@ -1,13 +1,14 @@
 import asyncio
 import time
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Optional
 
+from fastapi import HTTPException
 from loguru import logger
 
 from api.db import db_client
 from api.db.models import QueuedRunModel, WorkflowRunModel
-from api.enums import WorkflowRunState
+from api.enums import TelephonyCallStatus, WorkflowRunState
 from api.services.call_concurrency import (
     CallConcurrencyLimitError,
     CallConcurrencySlot,
@@ -22,6 +23,7 @@ from api.services.campaign.errors import (
 from api.services.quota_service import authorize_workflow_run_start
 from api.services.workflow.initial_context import merge_external_initial_context
 from api.services.workflow.run_creation import prepare_workflow_run_inputs
+from api.services.workflow_run_failure import mark_workflow_run_failed
 from api.utils.common import get_backend_endpoints
 
 if TYPE_CHECKING:
@@ -132,21 +134,36 @@ class CampaignCallDispatcher:
                     queued_run, campaign, concurrency_slot
                 )
 
-                # Update queued run as processed
-                await db_client.update_queued_run(
-                    queued_run_id=queued_run.id,
-                    state="processed",
-                    workflow_run_id=workflow_run.id,
-                    processed_at=datetime.now(UTC),
+                # Check if queued run was parked (e.g. awaiting WhatsApp call permission)
+                current_queued_run = await db_client.get_queued_run_by_id(queued_run.id)
+                is_parked = (
+                    current_queued_run
+                    and current_queued_run.state == "queued"
+                    and current_queued_run.retry_reason == "awaiting_whatsapp_permission"
                 )
 
-                processed_count += 1
-                processed_run_ids.add(queued_run.id)
+                if is_parked:
+                    # Keep parked in queued state
+                    processed_run_ids.add(queued_run.id)
+                    logger.info(
+                        f"[Campaign {campaign_id}] Queued run {queued_run.id} remains parked "
+                        "awaiting WhatsApp call permission"
+                    )
+                else:
+                    # Update queued run as processed
+                    await db_client.update_queued_run(
+                        queued_run_id=queued_run.id,
+                        state="processed",
+                        processed_at=datetime.now(UTC),
+                    )
 
-                # Update campaign processed count
-                await db_client.update_campaign(
-                    campaign_id=campaign_id, processed_rows=campaign.processed_rows + 1
-                )
+                    processed_count += 1
+                    processed_run_ids.add(queued_run.id)
+
+                    # Update campaign processed count
+                    await db_client.update_campaign(
+                        campaign_id=campaign_id, processed_rows=campaign.processed_rows + 1
+                    )
 
             except asyncio.CancelledError:
                 logger.warning(
@@ -309,20 +326,43 @@ class CampaignCallDispatcher:
 
             logger.info(f"Final initial_context: {initial_context}")
 
-            # Create workflow run with queued_run_id tracking
-            workflow_run_name = f"WR-CAMPAIGN-{campaign.id}-{queued_run.id}"
-            run_inputs = await prepare_workflow_run_inputs(db_client, workflow)
-            workflow_run = await db_client.create_workflow_run(
-                name=workflow_run_name,
-                workflow_id=campaign.workflow_id,
-                mode=workflow_run_mode,
-                user_id=campaign.created_by,
-                initial_context=initial_context,
-                campaign_id=campaign.id,
-                queued_run_id=queued_run.id,  # Link to queued run for retry tracking
-                organization_id=campaign.organization_id,
-                definition_id=run_inputs.definition_id,
+            # Create or reuse workflow run with queued_run_id tracking
+            workflow_run = None
+            existing_run = await db_client.get_workflow_run_by_queued_run_id(
+                queued_run.id
             )
+            if existing_run and not existing_run.is_completed:
+                workflow_run = existing_run
+                await db_client.update_workflow_run(
+                    run_id=workflow_run.id,
+                    initial_context=initial_context,
+                    gathered_context={
+                        "call_disposition": None,
+                        "mapped_call_disposition": None,
+                        "call_status": None,
+                        "error": None,
+                    },
+                    state=WorkflowRunState.INITIALIZED.value,
+                )
+                logger.info(
+                    f"[Campaign {campaign.id}] Reusing existing workflow run {workflow_run.id} "
+                    f"for queued run {queued_run.id}"
+                )
+
+            if not workflow_run:
+                workflow_run_name = f"WR-CAMPAIGN-{campaign.id}-{queued_run.id}"
+                run_inputs = await prepare_workflow_run_inputs(db_client, workflow)
+                workflow_run = await db_client.create_workflow_run(
+                    name=workflow_run_name,
+                    workflow_id=campaign.workflow_id,
+                    mode=workflow_run_mode,
+                    user_id=campaign.created_by,
+                    initial_context=initial_context,
+                    campaign_id=campaign.id,
+                    queued_run_id=queued_run.id,  # Link to queued run for retry tracking
+                    organization_id=campaign.organization_id,
+                    definition_id=run_inputs.definition_id,
+                )
             await call_concurrency.bind_workflow_run(concurrency_slot, workflow_run.id)
             slot_bound = True
 
@@ -398,6 +438,7 @@ class CampaignCallDispatcher:
                 from_number=from_number,
                 workflow_id=campaign.workflow_id,
                 organization_id=campaign.organization_id,
+                telephony_configuration_id=campaign.telephony_configuration_id,
             )
 
             # Store provider type and metadata in gathered_context
@@ -415,30 +456,139 @@ class CampaignCallDispatcher:
             )
 
         except Exception as e:
+            from api.services.telephony.base import TelephonyPermissionRequiredError
+
+            if isinstance(e, TelephonyPermissionRequiredError):
+                logger.info(
+                    f"[{provider.PROVIDER_NAME.upper()} Campaign] Missing call permission for workflow run {workflow_run.id} "
+                    f"(campaign {campaign.id}, lead: {phone_number}): {e}"
+                )
+                action = (campaign.orchestrator_metadata or {}).get(
+                    "whatsapp_permission_action", "skip"
+                )
+                retry_reason = f"awaiting_{provider.PROVIDER_NAME}_permission"
+                is_timeout = (
+                    queued_run.retry_reason == retry_reason
+                    or queued_run.retry_reason == "awaiting_whatsapp_permission"
+                )
+
+                # Parking is only justified once a request is actually on its way
+                # to the recipient. If sending it fails - or the provider cannot
+                # send one at all - nobody will ever be prompted, so parking for
+                # 24 hours just strands the lead until the timeout.
+                permission_request_sent = False
+                permission_request_error = None
+                if action == "request_and_wait" and getattr(e, "can_request_permission", True) and not is_timeout:
+                    try:
+                        # TelephonyProvider declares this hook and its default
+                        # raises, so a provider that cannot ask for consent
+                        # reports it here rather than being probed for the
+                        # method and silently skipped.
+                        await provider.send_call_permission_request(
+                            to_number=phone_number,
+                            organization_id=campaign.organization_id,
+                            telephony_configuration_id=campaign.telephony_configuration_id,
+                        )
+                        permission_request_sent = True
+                        logger.info(
+                            f"[{provider.PROVIDER_NAME.upper()} Campaign] Sent permission request to {phone_number} "
+                            f"for campaign {campaign.id}"
+                        )
+                    except Exception as req_err:
+                        permission_request_error = str(req_err)
+                        logger.warning(
+                            f"[{provider.PROVIDER_NAME.upper()} Campaign] Failed to send permission request to {phone_number}: {req_err}"
+                        )
+
+                if permission_request_sent:
+                    # Park the queued run with 24-hour expiration
+                    await db_client.update_queued_run(
+                        queued_run_id=queued_run.id,
+                        state="queued",
+                        retry_reason=retry_reason,
+                        scheduled_for=datetime.now(UTC) + timedelta(hours=24),
+                    )
+
+                    # Update the existing workflow run with awaiting_permission disposition,
+                    # keeping is_completed=False so it can be resumed when permission is granted
+                    await db_client.update_workflow_run(
+                        run_id=workflow_run.id,
+                        is_completed=False,
+                        state=WorkflowRunState.INITIALIZED.value,
+                        gathered_context={
+                            "call_disposition": TelephonyCallStatus.AWAITING_PERMISSION.value,
+                            "mapped_call_disposition": TelephonyCallStatus.AWAITING_PERMISSION.value,
+                            "call_status": TelephonyCallStatus.AWAITING_PERMISSION.value,
+                            "error": f"Call permission requested; awaiting recipient response. {e}",
+                        },
+                    )
+                else:
+                    disposition = (
+                        TelephonyCallStatus.PERMISSION_TIMEOUT.value
+                        if is_timeout
+                        else (
+                            TelephonyCallStatus.PERMISSION_DENIED.value
+                            if getattr(e, "status", None) == "denied"
+                            else TelephonyCallStatus.NO_PERMISSION.value
+                        )
+                    )
+                    await mark_workflow_run_failed(
+                        workflow_run.id,
+                        f"{e} Permission request could not be sent: {permission_request_error}"
+                        if permission_request_error
+                        else str(e),
+                        disposition=disposition,
+                    )
+                    # Mark queued run as processed to prevent retrying
+                    await db_client.update_queued_run(
+                        queued_run_id=queued_run.id,
+                        state="processed",
+                        processed_at=datetime.now(UTC),
+                    )
+
+                # Missing consent is the recipient's choice, not an outage, so it
+                # must not trip the breaker. A permission request we could not
+                # deliver is an outage, and counting it keeps a broken Meta
+                # integration from silently burning through the whole campaign.
+                await circuit_breaker.record_and_evaluate(
+                    campaign.id,
+                    is_failure=permission_request_error is not None,
+                    workflow_run_id=workflow_run.id,
+                    reason=(
+                        "permission_request_failed"
+                        if permission_request_error
+                        else "whatsapp_permission_required"
+                    ),
+                )
+                await self.release_call_slot(workflow_run.id)
+                return workflow_run
+
             logger.error(
                 f"Failed to initiate call for workflow run {workflow_run.id}: {e}"
             )
 
-            # Update workflow run as failed
-            telephony_callback_logs = workflow_run.logs.get(
-                "telephony_status_callbacks", []
+            is_token_expired = (
+                (isinstance(e, HTTPException) and e.status_code == 401)
+                or "token expired" in str(e).lower()
+                or "token has expired" in str(e).lower()
+                or "oauth" in str(e).lower()
+                or "invalid access token" in str(e).lower()
             )
-            telephony_callback_log = {
-                "status": "failed",
-                "timestamp": datetime.now(UTC).isoformat(),
-                "data": {"error": str(e)},
-            }
-            telephony_callback_logs.append(telephony_callback_log)
-            await db_client.update_workflow_run(
-                run_id=workflow_run.id,
-                is_completed=True,
-                state=WorkflowRunState.COMPLETED.value,
-                gathered_context={
-                    "error": str(e),
-                },
-                logs={
-                    "telephony_status_callbacks": telephony_callback_logs,
-                },
+            disposition = (
+                TelephonyCallStatus.TOKEN_EXPIRED.value
+                if is_token_expired
+                else TelephonyCallStatus.FAILED.value
+            )
+            clean_err = (
+                "WhatsApp access token has expired or is invalid. Please update credentials under Telephony Configuration."
+                if is_token_expired
+                else str(e)
+            )
+
+            await mark_workflow_run_failed(
+                workflow_run.id,
+                clean_err,
+                disposition=disposition,
             )
 
             # Record call initiation failure in circuit breaker
@@ -446,7 +596,7 @@ class CampaignCallDispatcher:
                 campaign.id,
                 is_failure=True,
                 workflow_run_id=workflow_run.id,
-                reason="call_initiation_failed",
+                reason="token_expired" if is_token_expired else "call_initiation_failed",
             )
 
             await self.release_call_slot(workflow_run.id)
@@ -537,7 +687,7 @@ class CampaignCallDispatcher:
         self,
         organization_id: int,
         telephony_configuration_id: int | None,
-        timeout: float = 600,
+        timeout: float = 600.0,
     ) -> Optional[str]:
         """
         Acquire a from_number from the (org, telephony config) pool with retry.

@@ -417,6 +417,50 @@ class TelephonyPhoneNumberModel(Base):
     )
 
 
+class WhatsAppCallPermissionModel(Base):
+    """WhatsApp call permission tracking for business-initiated calls (BIC)."""
+
+    __tablename__ = "whatsapp_call_permissions"
+
+    id = Column(Integer, primary_key=True, index=True)
+    organization_id = Column(
+        Integer, ForeignKey("organizations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    telephony_configuration_id = Column(
+        Integer, ForeignKey("telephony_configurations.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    phone_number_id = Column(String(64), nullable=False, index=True)
+    recipient_phone_number = Column(String(32), nullable=False, index=True)
+    status = Column(
+        String(32), nullable=False, default="pending"
+    )  # pending, granted_temporary, granted_permanent, denied, expired, revoked
+    permission_type = Column(String(32), nullable=True)  # temporary, permanent
+    meta_message_id = Column(String(128), nullable=True)
+    requested_at = Column(
+        DateTime(timezone=True), default=lambda: datetime.now(UTC), nullable=False
+    )
+    granted_at = Column(DateTime(timezone=True), nullable=True)
+    expires_at = Column(DateTime(timezone=True), nullable=True)
+    updated_at = Column(
+        DateTime(timezone=True),
+        default=lambda: datetime.now(UTC),
+        onupdate=lambda: datetime.now(UTC),
+        nullable=False,
+    )
+
+    configuration = relationship("TelephonyConfigurationModel")
+    organization = relationship("OrganizationModel")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "telephony_configuration_id",
+            "recipient_phone_number",
+            name="uq_whatsapp_perm_config_recipient",
+        ),
+        Index("ix_whatsapp_perm_lookup", "phone_number_id", "recipient_phone_number"),
+    )
+
+
 class IntegrationModel(Base):
     __tablename__ = "integrations"
 
@@ -917,6 +961,16 @@ class QueuedRunModel(Base):
             "campaign_id",
             "scheduled_for",
             postgresql_where=text("scheduled_for IS NOT NULL"),
+        ),
+        # Parked runs are looked up by retry_reason alone (no campaign_id) on
+        # every inbound permission webhook. state='queued' is not selective, so
+        # without this the lookup degrades to a full scan of queued_runs before
+        # its phone-number predicates are even evaluated. Parked rows are a tiny
+        # slice of the table, which is what makes the partial index cheap.
+        Index(
+            "idx_queued_runs_retry_reason_parked",
+            "retry_reason",
+            postgresql_where=text("state = 'queued' AND retry_reason IS NOT NULL"),
         ),
         UniqueConstraint(
             "campaign_id",

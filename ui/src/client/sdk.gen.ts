@@ -731,6 +731,13 @@ export const startCampaignApiV1CampaignCampaignIdStartPost = <ThrowOnError exten
 export const pauseCampaignApiV1CampaignCampaignIdPausePost = <ThrowOnError extends boolean = false>(options: Options<PauseCampaignApiV1CampaignCampaignIdPausePostData, ThrowOnError>): RequestResult<PauseCampaignApiV1CampaignCampaignIdPausePostResponses, PauseCampaignApiV1CampaignCampaignIdPausePostErrors, ThrowOnError> => (options.client ?? client).post<PauseCampaignApiV1CampaignCampaignIdPausePostResponses, PauseCampaignApiV1CampaignCampaignIdPausePostErrors, ThrowOnError>({ url: '/api/v1/campaign/{campaign_id}/pause', ...options });
 
 /**
+ * Sync WhatsApp Permissions
+ *
+ * Manually trigger WhatsApp call permission sync with Meta for parked leads in this campaign.
+ */
+export const syncWhatsAppPermissionsApiV1CampaignCampaignIdSyncWhatsappPermissionsPost = <ThrowOnError extends boolean = false>(options: Options<SyncWhatsAppPermissionsApiV1CampaignCampaignIdSyncWhatsappPermissionsPostData, ThrowOnError>): RequestResult<SyncWhatsAppPermissionsApiV1CampaignCampaignIdSyncWhatsappPermissionsPostResponses, unknown, ThrowOnError> => (options.client ?? client).post<SyncWhatsAppPermissionsApiV1CampaignCampaignIdSyncWhatsappPermissionsPostResponses, unknown, ThrowOnError>({ url: '/api/v1/campaign/{campaign_id}/sync-whatsapp-permissions', ...options });
+
+/**
  * Get Campaign Runs
  *
  * Get campaign workflow runs with pagination, filters and sorting

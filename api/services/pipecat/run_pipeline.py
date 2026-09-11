@@ -416,6 +416,7 @@ async def run_pipeline_smallwebrtc(
     call_context_vars: dict = {},
     user_provider_id: str | None = None,
     organization_id: int | None = None,
+    call_answered_event: asyncio.Event | None = None,
 ) -> None:
     """Run pipeline for WebRTC connections."""
     # Register before any async setup so deploy drains see calls that are still
@@ -430,6 +431,7 @@ async def run_pipeline_smallwebrtc(
             call_context_vars=call_context_vars,
             user_provider_id=user_provider_id,
             organization_id=organization_id,
+            call_answered_event=call_answered_event,
         )
     finally:
         try:
@@ -446,6 +448,7 @@ async def _run_pipeline_smallwebrtc_impl(
     call_context_vars: dict = {},
     user_provider_id: str | None = None,
     organization_id: int | None = None,
+    call_answered_event: asyncio.Event | None = None,
 ) -> None:
     """Run pipeline for WebRTC connections"""
     logger.debug(
@@ -519,6 +522,7 @@ async def _run_pipeline_smallwebrtc_impl(
         workflow_run=workflow_run,
         resolved_user_config=user_config,
         organization_id=organization_id,
+        call_answered_event=call_answered_event,
     )
 
 
@@ -567,6 +571,7 @@ async def _run_pipeline_impl(
     workflow_run=None,
     resolved_user_config=None,
     organization_id: int | None = None,
+    call_answered_event: asyncio.Event | None = None,
 ) -> None:
     """
     Run the pipeline with the given transport and configuration
@@ -1174,6 +1179,7 @@ async def _run_pipeline_impl(
         user_provider_id=user_provider_id,
         integration_runtime_sessions=integration_runtime_sessions,
         include_transcript_end_timestamps=include_transcript_end_timestamps,
+        call_answered_event=call_answered_event,
     )
 
     register_audio_data_handler(audio_buffer, workflow_run_id, in_memory_audio_buffer)

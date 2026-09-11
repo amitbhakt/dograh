@@ -478,3 +478,103 @@ class TestDispatcherThreadsTelephonyConfig:
                 f"({config_id}) so the number is returned to its pool; got "
                 f"args={args}, kwargs={kwargs}"
             )
+
+    @pytest.mark.asyncio
+    async def test_dispatch_call_handles_token_expired(self):
+        """When initiate_call fails with token expired, dispatcher marks workflow run with token_expired disposition."""
+        from fastapi import HTTPException
+        from api.enums import TelephonyCallStatus
+
+        org_id = 7
+        config_id = 4242
+        campaign = _make_campaign(
+            organization_id=org_id, telephony_configuration_id=config_id
+        )
+        queued_run = _make_queued_run()
+        workflow_run = SimpleNamespace(id=555, logs={})
+
+        provider = MagicMock()
+        provider.PROVIDER_NAME = "whatsapp"
+        provider.WEBHOOK_ENDPOINT = "whatsapp/voice"
+        provider.from_numbers = ["+15551110001"]
+        provider.initiate_call = AsyncMock(
+            side_effect=HTTPException(
+                status_code=401,
+                detail="Meta API Error (190): The WhatsApp access token has expired or is invalid.",
+            )
+        )
+
+        dispatcher = CampaignCallDispatcher()
+
+        with (
+            patch.object(
+                dispatcher,
+                "get_provider_for_campaign",
+                AsyncMock(return_value=provider),
+            ),
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.db_client"
+            ) as mock_db,
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.rate_limiter"
+            ) as mock_rl,
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.call_concurrency"
+            ) as mock_concurrency,
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.get_backend_endpoints",
+                AsyncMock(return_value=("https://example.com", None)),
+            ),
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.authorize_workflow_run_start",
+                AsyncMock(
+                    return_value=SimpleNamespace(has_quota=True, error_message="")
+                ),
+            ),
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.mark_workflow_run_failed"
+            ) as mock_mark_failed,
+            patch(
+                "api.services.campaign.campaign_call_dispatcher.circuit_breaker.record_and_evaluate"
+            ) as mock_circuit_breaker,
+        ):
+            mock_concurrency.release_slot = AsyncMock()
+            mock_db.get_workflow = AsyncMock(return_value=SimpleNamespace(id=1))
+            mock_db.get_telephony_configuration_for_org = AsyncMock(
+                return_value=SimpleNamespace(
+                    id=config_id,
+                    name="WhatsApp campaign",
+                    provider="whatsapp",
+                    credentials={"phone_number_id": "phone_id_1"},
+                )
+            )
+            mock_db.create_workflow_run = AsyncMock(return_value=workflow_run)
+            mock_db.update_workflow_run = AsyncMock()
+            mock_concurrency.bind_workflow_run = AsyncMock()
+            mock_concurrency.release_workflow_run_slot = AsyncMock()
+
+            mock_rl.acquire_from_number = AsyncMock(return_value="+15551110001")
+            mock_rl.release_from_number = AsyncMock()
+            mock_rl.store_workflow_from_number_mapping = AsyncMock()
+            mock_rl.get_workflow_from_number_mapping = AsyncMock(return_value=None)
+
+            slot = CallConcurrencySlot(
+                organization_id=org_id,
+                slot_id="slot-1",
+                max_concurrent=1,
+                source="test",
+            )
+
+            with pytest.raises(HTTPException):
+                await dispatcher.dispatch_call(queued_run, campaign, slot)
+
+            mock_mark_failed.assert_awaited_once()
+            fail_args = mock_mark_failed.await_args
+            assert fail_args.args[0] == workflow_run.id
+            assert fail_args.kwargs.get("disposition") == TelephonyCallStatus.TOKEN_EXPIRED.value
+            assert "The WhatsApp access token has expired" in fail_args.args[1] or "WhatsApp access token has expired" in fail_args.args[1]
+
+            mock_circuit_breaker.assert_awaited_once()
+            cb_kwargs = mock_circuit_breaker.await_args.kwargs
+            assert cb_kwargs.get("reason") == "token_expired"
+

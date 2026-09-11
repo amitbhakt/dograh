@@ -5,6 +5,7 @@ Consolidated from split modules for easier maintenance.
 
 import json
 import uuid
+from datetime import datetime, timezone
 from typing import Optional
 
 from fastapi import (
@@ -268,6 +269,8 @@ async def initiate_call(
         keywords = {
             "workflow_id": workflow.id,
             "organization_id": user.selected_organization_id,
+            "user_id": user.id,
+            "telephony_configuration_id": telephony_configuration_id,
         }
 
         # Initiate call via provider
@@ -303,7 +306,167 @@ async def initiate_call(
         initial_context=updated_initial_context,
     )
 
-    return {"message": f"Call initiated successfully with run name {workflow_run_name}"}
+    return {
+        "message": f"Call initiated successfully with run name {workflow_run_name}",
+        "workflow_run_id": workflow_run_id,
+        "workflow_run_name": workflow_run_name,
+        "call_id": result.call_id,
+    }
+
+
+@router.get("/runs/{workflow_run_id}/call-status")
+async def get_workflow_run_call_status(
+    workflow_run_id: int, user: UserModel = Depends(get_user)
+):
+    """Query live status of an active or recent telephony call."""
+    run = await db_client.get_workflow_run(
+        workflow_run_id, organization_id=user.selected_organization_id
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="Workflow run not found")
+
+    call_id = (run.gathered_context or {}).get("call_id")
+    connected_at = (run.gathered_context or {}).get("connected_at")
+    ended_at = (run.gathered_context or {}).get("ended_at")
+    error_msg = (run.gathered_context or {}).get("error")
+
+    # Check active WhatsApp connection if applicable
+    from api.services.telephony.providers.whatsapp.routes import (
+        get_active_whatsapp_connection_by_call_id,
+        get_active_whatsapp_connection_by_run_id,
+    )
+
+    wa_entry = None
+    if call_id:
+        wa_entry = get_active_whatsapp_connection_by_call_id(call_id)
+    if not wa_entry:
+        found = get_active_whatsapp_connection_by_run_id(workflow_run_id)
+        if found:
+            call_id = found[0]
+            wa_entry = (found[1], workflow_run_id, user.selected_organization_id, "")
+
+    call_status = (run.gathered_context or {}).get("call_status")
+    is_whatsapp = (
+        run.mode == "whatsapp"
+        or (run.gathered_context or {}).get("provider") == "whatsapp"
+        or (call_id and str(call_id).startswith("wacid."))
+    )
+
+    is_peer_connected = False
+    if wa_entry:
+        conn = wa_entry[0]
+        if conn.is_connected():
+            is_peer_connected = True
+            # For non-WhatsApp or inbound browser WebRTC, peer connection means user is connected.
+            # For WhatsApp outbound, WebRTC connects during dialing while remote phone is ringing;
+            # the call is only answered once Meta sends ACCEPTED (call_status == "in-progress").
+            if not is_whatsapp:
+                if not connected_at:
+                    connected_at = datetime.now(timezone.utc).isoformat()
+                    ctx = dict(run.gathered_context or {})
+                    ctx["connected_at"] = connected_at
+                    ctx["call_status"] = "in-progress"
+                    await db_client.update_workflow_run(
+                        run.id,
+                        state=WorkflowRunState.RUNNING.value,
+                        gathered_context=ctx,
+                    )
+
+    if run.is_completed:
+        status = "failed" if error_msg else "completed"
+    elif is_whatsapp:
+        if connected_at and call_status == "in-progress":
+            status = "connected"
+        else:
+            status = "ringing"
+    elif is_peer_connected or connected_at or (run.state == WorkflowRunState.RUNNING.value and call_status != "ringing"):
+        status = "connected"
+    else:
+        status = "ringing"
+
+    # Compute duration in seconds (starting from when answered)
+    duration_seconds = 0
+    if connected_at and status in ("connected", "completed"):
+        try:
+            start_t = datetime.fromisoformat(connected_at)
+            end_t = (
+                datetime.fromisoformat(ended_at)
+                if ended_at
+                else datetime.now(timezone.utc)
+            )
+            duration_seconds = max(0, int((end_t - start_t).total_seconds()))
+        except Exception:
+            duration_seconds = 0
+
+    return {
+        "workflow_run_id": run.id,
+        "call_id": call_id,
+        "status": status,
+        "is_completed": run.is_completed,
+        "connected_at": connected_at,
+        "ended_at": ended_at,
+        "duration_seconds": duration_seconds,
+        "error": error_msg,
+    }
+
+
+@router.post("/runs/{workflow_run_id}/end-call")
+async def end_workflow_run_call(
+    workflow_run_id: int, user: UserModel = Depends(get_user)
+):
+    """End an active outbound telephony call."""
+    run = await db_client.get_workflow_run(
+        workflow_run_id, organization_id=user.selected_organization_id
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="Workflow run not found")
+
+    call_id = (run.gathered_context or {}).get("call_id")
+    provider_name = (run.gathered_context or {}).get("provider") or run.mode
+
+    if provider_name == "whatsapp" or (call_id and str(call_id).startswith("wacid.")):
+        from api.services.telephony.providers.whatsapp.routes import terminate_whatsapp_call_by_id
+        if call_id:
+            await terminate_whatsapp_call_by_id(
+                call_id, workflow_run_id, user.selected_organization_id
+            )
+        else:
+            await db_client.update_workflow_run(
+                run.id,
+                is_completed=True,
+                state=WorkflowRunState.COMPLETED.value,
+            )
+            await call_concurrency.release_workflow_run_slot(run.id)
+    else:
+        await db_client.update_workflow_run(
+            run.id,
+            is_completed=True,
+            state=WorkflowRunState.COMPLETED.value,
+        )
+        await call_concurrency.release_workflow_run_slot(run.id)
+
+    return {"status": "success", "message": "Call ended successfully"}
+
+
+@router.get("/webhook")
+async def handle_telephony_webhook_get(request: Request):
+    """Alias for /telephony/whatsapp/webhook GET verification handshake."""
+    from api.services.telephony.providers.whatsapp.routes import handle_webhook_verification
+    params = request.query_params
+    if "hub.mode" in params:
+        return await handle_webhook_verification(
+            hub_mode=params["hub.mode"],
+            hub_verify_token=params.get("hub.verify_token", ""),
+            hub_challenge=params.get("hub.challenge", ""),
+        )
+    raise HTTPException(status_code=404, detail="Not Found")
+
+
+@router.post("/webhook")
+async def handle_telephony_webhook_post(request: Request):
+    """Alias for /telephony/whatsapp/webhook POST event handling."""
+    from api.services.telephony.providers.whatsapp.routes import handle_whatsapp_webhook
+    return await handle_whatsapp_webhook(request)
 
 
 async def _verify_organization_phone_number(

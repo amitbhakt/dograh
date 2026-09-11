@@ -284,6 +284,26 @@ class CallConcurrencyService:
                 f"Concurrent slot mapping for workflow run {workflow_run_id} "
                 "had no live slot; deleted stale mapping"
             )
+
+        # Release caller ID / from_number back to its pool if mapped
+        try:
+            from_number_mapping = (
+                await rate_limiter.get_workflow_from_number_mapping(workflow_run_id)
+            )
+            if from_number_mapping:
+                fn_org_id, from_number, config_id = from_number_mapping
+                await rate_limiter.release_from_number(
+                    fn_org_id, from_number, telephony_configuration_id=config_id
+                )
+                await rate_limiter.delete_workflow_from_number_mapping(workflow_run_id)
+                logger.debug(
+                    f"Released mapped from_number {from_number} for workflow run {workflow_run_id}"
+                )
+        except Exception as e:
+            logger.warning(
+                f"Error releasing from_number for workflow run {workflow_run_id}: {e}"
+            )
+
         return released
 
 

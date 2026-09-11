@@ -14,6 +14,7 @@ import {
     redialCampaignApiV1CampaignCampaignIdRedialPost,
     resumeCampaignApiV1CampaignCampaignIdResumePost,
     startCampaignApiV1CampaignCampaignIdStartPost,
+    syncWhatsAppPermissionsApiV1CampaignCampaignIdSyncWhatsappPermissionsPost,
 } from '@/client/sdk.gen';
 import type { CampaignResponse } from '@/client/types.gen';
 import { Badge } from '@/components/ui/badge';
@@ -53,6 +54,8 @@ export default function CampaignDetailPage() {
     // Action state
     const [isExecutingAction, setIsExecutingAction] = useState(false);
     const [isDownloadingReport, setIsDownloadingReport] = useState(false);
+    const [isSyncingWhatsApp, setIsSyncingWhatsApp] = useState(false);
+    const [runsRefreshTrigger, setRunsRefreshTrigger] = useState(0);
 
     // Report date range state
     const [reportStartDate, setReportStartDate] = useState<Date | undefined>(undefined);
@@ -198,6 +201,48 @@ export default function CampaignDetailPage() {
         setReportStartTime('00:00');
         setReportEndDate(undefined);
         setReportEndTime('23:59');
+    };
+
+    // Handle manual sync WhatsApp call permissions with Meta
+    const handleSyncWhatsAppPermissions = async () => {
+        if (!user) return;
+        setIsSyncingWhatsApp(true);
+        try {
+            const accessToken = await getAccessToken();
+            const response = await syncWhatsAppPermissionsApiV1CampaignCampaignIdSyncWhatsappPermissionsPost({
+                path: {
+                    campaign_id: campaignId,
+                },
+                headers: {
+                    'Authorization': `Bearer ${accessToken}`,
+                },
+            });
+
+            if (response.data) {
+                const reactivated = response.data.reactivated_count || 0;
+                if (reactivated > 0) {
+                    toast.success(`WhatsApp permissions synced: ${reactivated} lead${reactivated > 1 ? 's' : ''} unparked and queued for calling!`);
+                } else {
+                    toast.info('WhatsApp permissions synced. No new permissions were granted by recipients yet.');
+                }
+                // Refresh campaign stats and runs table
+                await fetchCampaign();
+                setRunsRefreshTrigger((prev) => prev + 1);
+            } else if (response.error) {
+                let errorMsg = 'Failed to sync WhatsApp permissions';
+                if (typeof response.error === 'string') {
+                    errorMsg = response.error;
+                } else if (response.error && typeof response.error === 'object') {
+                    errorMsg = (response.error as unknown as { detail?: string }).detail || JSON.stringify(response.error);
+                }
+                toast.error(errorMsg);
+            }
+        } catch (error) {
+            console.error('Failed to sync WhatsApp permissions:', error);
+            toast.error('Failed to sync WhatsApp permissions');
+        } finally {
+            setIsSyncingWhatsApp(false);
+        }
     };
 
     // Handle start campaign
@@ -374,6 +419,11 @@ export default function CampaignDetailPage() {
     };
 
     const canEdit = campaign && ['created', 'running', 'paused'].includes(campaign.state);
+
+    const isWhatsAppCampaign = Boolean(
+        campaign?.telephony_configuration_name?.toLowerCase().includes('whatsapp') ||
+        (campaign as any)?.whatsapp_permission_action
+    );
 
     // Newest entries first. The backend appends chronologically; the UI is more
     // useful when the most recent failure / pause is at the top.
@@ -881,6 +931,9 @@ export default function CampaignDetailPage() {
                     campaignId={campaignId}
                     workflowId={campaign.workflow_id}
                     searchParams={searchParams}
+                    refreshTrigger={runsRefreshTrigger}
+                    isWhatsAppCampaign={isWhatsAppCampaign}
+                    onSyncWhatsAppPermissions={handleSyncWhatsAppPermissions}
                 />
 
                 <Dialog open={isRedialDialogOpen} onOpenChange={setIsRedialDialogOpen}>

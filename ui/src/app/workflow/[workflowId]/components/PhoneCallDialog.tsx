@@ -2,7 +2,7 @@
 
 import 'react-international-phone/style.css';
 
-import { Loader2 } from "lucide-react";
+import { Clock, Loader2, PhoneOff } from "lucide-react";
 import { useRouter } from "next/navigation";
 import { useCallback, useEffect, useState } from "react";
 import { PhoneInput } from 'react-international-phone';
@@ -39,7 +39,14 @@ import {
     SelectTrigger,
     SelectValue,
 } from "@/components/ui/select";
+import {
+    Tooltip,
+    TooltipContent,
+    TooltipProvider,
+    TooltipTrigger,
+} from "@/components/ui/tooltip";
 import { useUserConfig } from "@/context/UserConfigContext";
+import { useAuth } from "@/lib/auth";
 import { detailFromError } from "@/lib/apiError";
 
 interface PhoneCallDialogProps {
@@ -68,6 +75,7 @@ export const PhoneCallDialog = ({
 }: PhoneCallDialogProps) => {
     const router = useRouter();
     const { refreshConfig } = useUserConfig();
+    const { getAccessToken } = useAuth();
     const [preferences, setPreferences] = useState<OrganizationPreferences>({});
     const [preferencesLoaded, setPreferencesLoaded] = useState(false);
     const [phoneNumber, setPhoneNumber] = useState("");
@@ -84,6 +92,23 @@ export const PhoneCallDialog = ({
     const [selectedFromPhoneNumberId, setSelectedFromPhoneNumberId] = useState<string>("");
     const [loadingPhoneNumbers, setLoadingPhoneNumbers] = useState(false);
     const [apiProviderNames, setApiProviderNames] = useState<string[]>([]);
+
+    // WhatsApp outbound permission state
+    const [waPermissionStatus, setWaPermissionStatus] = useState<string>("idle");
+    const [waHoursRemaining, setWaHoursRemaining] = useState<number | null>(null);
+    const [waRestrictedReason, setWaRestrictedReason] = useState<string | null>(null);
+    const [waDeliveryError, setWaDeliveryError] = useState<string | null>(null);
+    const [waCanRequest, setWaCanRequest] = useState<boolean>(true);
+    const [waRequestLimitReason, setWaRequestLimitReason] = useState<string | null>(null);
+    const [requestingWaPermission, setRequestingWaPermission] = useState(false);
+    const [customWaMessage, setCustomWaMessage] = useState<string>("");
+    const [showCustomWaMessage, setShowCustomWaMessage] = useState<boolean>(false);
+
+    // Active call live tracking state
+    const [activeRunId, setActiveRunId] = useState<number | null>(null);
+    const [callStatus, setCallStatus] = useState<"idle" | "calling" | "connected" | "ended" | "failed">("idle");
+    const [callDuration, setCallDuration] = useState<number>(0);
+    const [endingCall, setEndingCall] = useState<boolean>(false);
 
     const fetchPreferences = useCallback(async () => {
         const result =
@@ -182,6 +207,10 @@ export const PhoneCallDialog = ({
             setSelectedConfigId("");
             setFromPhoneNumbers([]);
             setSelectedFromPhoneNumberId("");
+            setActiveRunId(null);
+            setCallStatus("idle");
+            setCallDuration(0);
+            setEndingCall(false);
         }
     }, [open]);
 
@@ -233,18 +262,166 @@ export const PhoneCallDialog = ({
     const selectedConfig = telephonyConfigs.find(
         (config) => String(config.id) === selectedConfigId,
     );
+    const isWhatsApp = selectedConfig?.provider === "whatsapp";
     const selectedConfigBlocked =
         selectedConfig !== undefined && !isCallable(selectedConfig);
-    // Nothing here can place a call: either the org has no configurations, or
-    // the ones it has are still waiting on the customer's own carrier. An org
-    // whose only configurations are *inactive* is a different problem, so it
-    // falls through to the form rather than getting setup instructions.
+
+    const nonSipConfigs = telephonyConfigs.filter(
+        (config) => config.connectivity !== "sip" && !config.inactive,
+    );
+    const hasPendingOutbound = telephonyConfigs.some(
+        (config) =>
+            !config.inactive &&
+            config.is_ready_for_outbound === false,
+    );
     const needsPhoneService =
         needsConfiguration === true ||
-        (!telephonyConfigs.some(isCallable) &&
-            telephonyConfigs.some(
-                (config) => !config.inactive && config.is_ready_for_outbound === false,
-            ));
+        telephonyConfigs.length === 0 ||
+        (hasPendingOutbound && !telephonyConfigs.some(isCallable) && nonSipConfigs.length === 0);
+
+    const checkWhatsAppPermissionNow = useCallback(async (phone: string, configId: string) => {
+        const raw = phone.trim();
+        if (!raw || raw.length < 8 || !configId) return;
+
+        setWaPermissionStatus("checking");
+        try {
+            const token = await getAccessToken();
+            const headers: Record<string, string> = token
+                ? { Authorization: `Bearer ${token}` }
+                : {};
+            const res = await fetch(
+                `/api/v1/telephony/whatsapp/permissions/check?telephony_configuration_id=${configId}&recipient_phone_number=${encodeURIComponent(raw)}`,
+                { headers }
+            );
+            if (!res.ok) {
+                setWaPermissionStatus("not_requested");
+                return;
+            }
+            const data = await res.json().catch(() => ({}));
+            if (data.restricted_country) {
+                setWaPermissionStatus("restricted");
+                setWaRestrictedReason(data.restriction_reason);
+            } else if (data.can_call) {
+                setWaPermissionStatus("granted");
+                setWaHoursRemaining(data.hours_remaining ?? null);
+                setWaDeliveryError(null);
+                setWaCanRequest(false);
+                setWaRequestLimitReason(null);
+            } else {
+                setWaPermissionStatus(data.status || "not_requested");
+                setWaHoursRemaining(data.hours_remaining ?? null);
+                setWaDeliveryError(data.delivery_error || null);
+                setWaCanRequest(data.can_request_permission ?? true);
+                setWaRequestLimitReason(data.request_limit_reason || null);
+            }
+        } catch {
+            setWaPermissionStatus("not_requested");
+        }
+    }, [getAccessToken]);
+
+    // Check WhatsApp call permission when number or config changes
+    useEffect(() => {
+        if (!open || !isWhatsApp || !selectedConfigId) {
+            setWaPermissionStatus("idle");
+            setWaHoursRemaining(null);
+            setWaRestrictedReason(null);
+            return;
+        }
+
+        const raw = phoneNumber.trim();
+        if (!raw || raw.length < 5) {
+            setWaPermissionStatus("idle");
+            setWaHoursRemaining(null);
+            setWaRestrictedReason(null);
+            return;
+        }
+
+        setWaRestrictedReason(null);
+        if (raw.length < 8) {
+            setWaPermissionStatus("idle");
+            return;
+        }
+
+        let cancelled = false;
+        const timer = setTimeout(async () => {
+            if (!cancelled) {
+                await checkWhatsAppPermissionNow(raw, selectedConfigId);
+            }
+        }, 500);
+
+        return () => {
+            cancelled = true;
+            clearTimeout(timer);
+        };
+    }, [open, isWhatsApp, selectedConfigId, phoneNumber, checkWhatsAppPermissionNow]);
+
+    // Load saved default permission message from configuration
+    useEffect(() => {
+        if (!open || !isWhatsApp || !selectedConfigId) {
+            setCustomWaMessage("");
+            setShowCustomWaMessage(false);
+            return;
+        }
+        let cancelled = false;
+        (async () => {
+            try {
+                const token = await getAccessToken();
+                const res = await fetch(`/api/v1/organizations/telephony-configs/${selectedConfigId}`, {
+                    headers: token ? { Authorization: `Bearer ${token}` } : {},
+                });
+                if (!res.ok || cancelled) return;
+                const data = await res.json();
+                if (cancelled) return;
+                const saved = data?.credentials?.default_permission_message;
+                if (saved) {
+                    setCustomWaMessage(saved);
+                }
+            } catch {
+                // Ignore failure to load config detail
+            }
+        })();
+        return () => {
+            cancelled = true;
+        };
+    }, [open, isWhatsApp, selectedConfigId, getAccessToken]);
+
+    const handleRequestWhatsAppPermission = async () => {
+        if (!selectedConfigId || !phoneNumber) return;
+        setRequestingWaPermission(true);
+        setCallError(null);
+        try {
+            const token = await getAccessToken();
+            const headers: Record<string, string> = {
+                'Content-Type': 'application/json',
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            };
+            const payload: Record<string, any> = {
+                telephony_configuration_id: Number(selectedConfigId),
+                recipient_phone_number: phoneNumber,
+            };
+            if (customWaMessage.trim()) {
+                payload.body_text = customWaMessage.trim();
+            }
+            const res = await fetch('/api/v1/telephony/whatsapp/permissions/request', {
+                method: 'POST',
+                headers,
+                body: JSON.stringify(payload),
+            });
+            const data = await res.json().catch(() => ({}));
+            if (!res.ok) {
+                throw new Error(
+                    data.detail || `Failed to send WhatsApp call permission request (${res.status} ${res.statusText || ""})`
+                );
+            }
+            setWaPermissionStatus("pending");
+            setWaHoursRemaining(168);
+            setWaDeliveryError(null);
+        } catch (err: any) {
+            setCallError(err.message || "Failed to send permission request");
+        } finally {
+            setRequestingWaPermission(false);
+        }
+    };
 
     const goToConfiguration = (target?: { configId?: number; add?: boolean }) => {
         onOpenChange(false);
@@ -282,7 +459,116 @@ export const PhoneCallDialog = ({
         await refreshConfig();
     };
 
+    const handleResetCall = () => {
+        setActiveRunId(null);
+        setCallStatus("idle");
+        setCallDuration(0);
+        setEndingCall(false);
+        setCallSuccessMsg(null);
+        setCallError(null);
+    };
+
+    const formatDuration = (seconds: number) => {
+        const mins = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        return `${mins.toString().padStart(2, "0")}:${secs.toString().padStart(2, "0")}`;
+    };
+
+    const handleEndCall = async () => {
+        if (!activeRunId) return;
+        setEndingCall(true);
+        try {
+            const token = await getAccessToken();
+            const headers: Record<string, string> = {
+                "Content-Type": "application/json",
+                ...(token ? { Authorization: `Bearer ${token}` } : {}),
+            };
+            await fetch(`/api/v1/telephony/runs/${activeRunId}/end-call`, {
+                method: "POST",
+                headers,
+            });
+            setCallStatus("ended");
+        } catch (err: unknown) {
+            console.error("Failed to end call:", err);
+        } finally {
+            setEndingCall(false);
+        }
+    };
+
+    // Poll active call status every 1 second when calling or connected
+    useEffect(() => {
+        if (!open || !activeRunId || (callStatus !== "calling" && callStatus !== "connected")) {
+            return;
+        }
+
+        let cancelled = false;
+        const pollInterval = setInterval(async () => {
+            try {
+                const token = await getAccessToken();
+                const headers: Record<string, string> = {
+                    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+                };
+                const res = await fetch(`/api/v1/telephony/runs/${activeRunId}/call-status`, {
+                    headers,
+                });
+                if (cancelled || !res.ok) return;
+                const data = await res.json();
+                if (cancelled) return;
+
+                if (data.status === "connected") {
+                    setCallStatus("connected");
+                    if (typeof data.duration_seconds === "number") {
+                        setCallDuration(data.duration_seconds);
+                    }
+                } else if (data.status === "ringing") {
+                    setCallStatus("calling");
+                    setCallDuration(0);
+                } else if (data.status === "failed") {
+                    setCallStatus("failed");
+                    if (data.error) setCallError(data.error);
+                } else if (data.status === "completed" || data.is_completed) {
+                    setCallStatus("ended");
+                    if (typeof data.duration_seconds === "number") {
+                        setCallDuration(data.duration_seconds);
+                    }
+                    if (data.error) setCallError(data.error);
+                }
+            } catch (err) {
+                console.error("Error polling call status:", err);
+            }
+        }, 1000);
+
+        return () => {
+            cancelled = true;
+            clearInterval(pollInterval);
+        };
+    }, [open, activeRunId, callStatus, getAccessToken]);
+
+    // Timer increment while connected
+    useEffect(() => {
+        if (callStatus !== "connected") return;
+        const timer = setInterval(() => {
+            setCallDuration((prev) => prev + 1);
+        }, 1000);
+        return () => clearInterval(timer);
+    }, [callStatus]);
+
     const handleStartCall = async () => {
+        if (isWhatsApp) {
+            if (waPermissionStatus === "restricted") {
+                setCallError(
+                    waRestrictedReason ||
+                        "Business-Initiated WhatsApp Calls are not supported in this country.",
+                );
+                return;
+            }
+            if (waPermissionStatus !== "granted") {
+                setCallError(
+                    "Permission to call this WhatsApp number has not been granted by the recipient. Please send a permission request first.",
+                );
+                return;
+            }
+        }
         setCallLoading(true);
         setCallError(null);
         setCallSuccessMsg(null);
@@ -311,12 +597,21 @@ export const PhoneCallDialog = ({
                     errMsg = (response.error as unknown as { detail: string }).detail || JSON.stringify(response.error);
                 }
                 setCallError(errMsg);
+                setCallStatus("failed");
             } else {
-                const msg = response.data && (response.data as unknown as { message: string }).message || "Call initiated successfully!";
+                const rawData = response.data as any;
+                const msg = rawData?.message || "Call initiated successfully!";
+                const runId = rawData?.workflow_run_id;
+                if (runId) {
+                    setActiveRunId(runId);
+                }
+                setCallStatus("calling");
+                setCallDuration(0);
                 setCallSuccessMsg(typeof msg === "string" ? msg : JSON.stringify(msg));
             }
         } catch (err: unknown) {
             setCallError(err instanceof Error ? err.message : "Failed to initiate call");
+            setCallStatus("failed");
         } finally {
             setCallLoading(false);
         }
@@ -460,20 +755,24 @@ export const PhoneCallDialog = ({
                 <div className="flex flex-col gap-1.5">
                     <Label htmlFor="telephony-config">Telephony configuration</Label>
                     <Select value={selectedConfigId} onValueChange={setSelectedConfigId}>
-                        <SelectTrigger id="telephony-config" className="w-full">
+                        <SelectTrigger id="telephony-config" className="w-full max-w-full overflow-hidden min-w-0 [&>span]:truncate [&>span]:min-w-0">
                             <SelectValue placeholder="Select a configuration" />
                         </SelectTrigger>
                         <SelectContent>
-                            {telephonyConfigs.map((config) => (
-                                <SelectItem key={config.id} value={String(config.id)}>
-                                    {config.name} ({config.provider})
-                                    {config.is_default_outbound ? " - default" : ""}
-                                    {!isCallable(config) ? " - setup incomplete" : ""}
-                                </SelectItem>
-                            ))}
+                            {telephonyConfigs.map((config) => {
+                                const statusSuffix = !isCallable(config)
+                                    ? " - setup incomplete"
+                                    : "";
+                                const label = `${config.name} (${config.provider})${config.is_default_outbound ? " - default" : ""}${statusSuffix}`;
+                                return (
+                                    <SelectItem key={config.id} value={String(config.id)} title={label}>
+                                        <span className="truncate max-w-[380px]">{label}</span>
+                                    </SelectItem>
+                                );
+                            })}
                         </SelectContent>
                     </Select>
-                    {selectedConfigBlocked && (
+                    {selectedConfigBlocked ? (
                         <p className="text-xs text-amber-600 dark:text-amber-500">
                             {selectedConfig?.inactive
                                 ? "This configuration is disabled after repeated connection failures."
@@ -489,7 +788,7 @@ export const PhoneCallDialog = ({
                                 {selectedConfig?.inactive ? "Open configuration" : "Finish setup"}
                             </button>
                         </p>
-                    )}
+                    ) : null}
                 </div>
             )}
             {selectedConfigId && (
@@ -505,16 +804,18 @@ export const PhoneCallDialog = ({
                             value={selectedFromPhoneNumberId}
                             onValueChange={setSelectedFromPhoneNumberId}
                         >
-                            <SelectTrigger id="from-phone-number" className="w-full">
+                            <SelectTrigger id="from-phone-number" className="w-full max-w-full overflow-hidden min-w-0 [&>span]:truncate [&>span]:min-w-0">
                                 <SelectValue placeholder="Select a phone number" />
                             </SelectTrigger>
                             <SelectContent>
-                                {fromPhoneNumbers.map((phone) => (
-                                    <SelectItem key={phone.id} value={String(phone.id)}>
-                                        {phone.label ? `${phone.label} - ${phone.address}` : phone.address}
-                                        {phone.is_default_caller_id ? " - default" : ""}
-                                    </SelectItem>
-                                ))}
+                                {fromPhoneNumbers.map((phone) => {
+                                    const label = `${phone.label ? `${phone.label} - ${phone.address}` : phone.address}${phone.is_default_caller_id ? " - default" : ""}`;
+                                    return (
+                                        <SelectItem key={phone.id} value={String(phone.id)} title={label}>
+                                            <span className="truncate max-w-[380px]">{label}</span>
+                                        </SelectItem>
+                                    );
+                                })}
                             </SelectContent>
                         </Select>
                     ) : selectedConfigBlocked ? (
@@ -541,6 +842,8 @@ export const PhoneCallDialog = ({
                     defaultCountry="in"
                     value={phoneNumber}
                     onChange={handlePhoneInputChange}
+                    className="w-full"
+                    inputClassName="!w-full !bg-transparent !text-foreground !border-input"
                 />
             )}
             <button
@@ -550,6 +853,266 @@ export const PhoneCallDialog = ({
             >
                 {sipMode ? "Use phone number instead" : "Use SIP endpoint instead"}
             </button>
+            {isWhatsApp && !selectedConfigBlocked && phoneNumber.trim().length >= 4 && (
+                <div className="space-y-2 pt-1">
+                    {waPermissionStatus === "restricted" && (
+                        <div className="rounded-md border border-destructive/50 bg-destructive/10 p-3 text-xs text-destructive">
+                            <div className="font-semibold mb-0.5">Country Not Supported for WhatsApp Outbound Calls</div>
+                            <div>{waRestrictedReason || "Business-Initiated WhatsApp Calls are restricted in this destination country."}</div>
+                        </div>
+                    )}
+                    {waPermissionStatus === "checking" && (
+                        <div className="flex items-center text-xs text-muted-foreground gap-2 py-1">
+                            <Loader2 className="h-3.5 w-3.5 animate-spin" />
+                            Checking WhatsApp call permission with Meta...
+                        </div>
+                    )}
+                    {waPermissionStatus === "granted" && (
+                        <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs text-emerald-700 dark:text-emerald-400">
+                            <div className="font-semibold mb-0.5 flex items-center gap-1.5">
+                                <span>✓</span> WhatsApp Call Permission Granted
+                            </div>
+                            <div>
+                                Recipient has granted call permission
+                                {waHoursRemaining ? ` (valid for ~${Math.round(waHoursRemaining)}h)` : ""}.
+                            </div>
+                        </div>
+                    )}
+                    {waPermissionStatus === "pending" && (
+                        <div className="rounded-md border border-blue-500/30 bg-blue-500/10 p-3 text-xs text-blue-700 dark:text-blue-400 space-y-2">
+                            <div className="font-semibold mb-0.5">Permission Request Pending</div>
+                            <div>
+                                An interactive permission request was sent to this WhatsApp number.
+                                Waiting for the recipient to accept on WhatsApp
+                                {waHoursRemaining ? ` (request valid for ~${Math.round(waHoursRemaining)}h)` : ""}.
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2 pt-1">
+                                <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-7 text-xs"
+                                    onClick={() => checkWhatsAppPermissionNow(phoneNumber, selectedConfigId)}
+                                >
+                                    Re-check Status
+                                </Button>
+                                <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-7 text-xs bg-blue-500/20 border-blue-500/40 hover:bg-blue-500/30 text-blue-900 dark:text-blue-200"
+                                    disabled={requestingWaPermission || waCanRequest === false}
+                                    onClick={handleRequestWhatsAppPermission}
+                                    title={waCanRequest === false ? (waRequestLimitReason || "Meta limit reached") : "Re-send permission request to recipient"}
+                                >
+                                    {requestingWaPermission ? (
+                                        <>
+                                            <Loader2 className="h-3 w-3 animate-spin mr-1.5" />
+                                            Sending...
+                                        </>
+                                    ) : (
+                                        "Re-send Request"
+                                    )}
+                                </Button>
+                            </div>
+                            {waCanRequest === false && waRequestLimitReason && (
+                                <div className="text-[11px] text-muted-foreground italic">
+                                    {waRequestLimitReason}
+                                </div>
+                            )}
+                        </div>
+                    )}
+                    {waPermissionStatus === "delivery_failed" && (
+                        <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-700 dark:text-red-400 space-y-2">
+                            <div className="font-semibold mb-0.5 flex items-center gap-1.5">
+                                <span>⚠️</span> Permission Request Delivery Failed
+                            </div>
+                            <div>
+                                {waDeliveryError ||
+                                    "Permission request message failed to deliver because the 24-hour customer service window is closed."}
+                            </div>
+                            <div className="p-2 rounded bg-background/60 text-muted-foreground">
+                                <strong>How to fix:</strong> Ask the recipient to send any WhatsApp message (e.g. &quot;Hi&quot;) to your business number first. This opens the 24-hour customer service window so permission requests can be delivered.
+                            </div>
+                            <div className="flex flex-wrap items-center gap-2 pt-1">
+                                <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-7 text-xs"
+                                    disabled={requestingWaPermission || waCanRequest === false}
+                                    onClick={handleRequestWhatsAppPermission}
+                                >
+                                    {requestingWaPermission ? (
+                                        <>
+                                            <Loader2 className="h-3 w-3 animate-spin mr-1.5" />
+                                            Retrying...
+                                        </>
+                                    ) : (
+                                        "Retry Sending Request"
+                                    )}
+                                </Button>
+                                <Button
+                                    type="button"
+                                    variant="outline"
+                                    size="sm"
+                                    className="h-7 text-xs"
+                                    onClick={() => checkWhatsAppPermissionNow(phoneNumber, selectedConfigId)}
+                                >
+                                    Re-check Status
+                                </Button>
+                            </div>
+                            {waCanRequest === false && waRequestLimitReason && (
+                                <div className="text-[11px] text-muted-foreground italic">
+                                    {waRequestLimitReason}
+                                </div>
+                            )}
+                        </div>
+                    )}
+                    {waPermissionStatus === "token_expired" && (
+                        <div className="rounded-md border border-destructive/40 bg-destructive/10 p-3 text-xs text-destructive space-y-2">
+                            <div className="font-semibold mb-0.5 flex items-center gap-1.5">
+                                <span>⚠️</span> WhatsApp Access Token Expired or Invalid
+                            </div>
+                            <div>
+                                {waDeliveryError ||
+                                    "The Meta access token for this WhatsApp telephony configuration has expired or is invalid."}
+                            </div>
+                            <div className="pt-1">
+                                <button
+                                    type="button"
+                                    className="underline font-semibold hover:opacity-80"
+                                    onClick={() => goToConfiguration({ configId: Number(selectedConfigId) })}
+                                >
+                                    Update Token in Telephony Configurations →
+                                </button>
+                            </div>
+                        </div>
+                    )}
+                    {(waPermissionStatus === "not_requested" ||
+                        waPermissionStatus === "no_permission" ||
+                        waPermissionStatus === "revoked" ||
+                        waPermissionStatus === "expired" ||
+                        waPermissionStatus === "denied") && (
+                        <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-700 dark:text-amber-400 space-y-2">
+                            <div className="font-semibold mb-0.5">
+                                {waPermissionStatus === "expired"
+                                    ? "WhatsApp Call Permission Expired"
+                                    : waPermissionStatus === "denied"
+                                    ? "WhatsApp Call Permission Denied"
+                                    : waPermissionStatus === "revoked" || waPermissionStatus === "no_permission"
+                                    ? "WhatsApp Call Permission Revoked / Not Granted"
+                                    : "WhatsApp Call Permission Required"}
+                            </div>
+                            <div>
+                                Meta requires recipient permission before placing an outbound WhatsApp call.
+                                Send an interactive request to their WhatsApp to grant permission.
+                            </div>
+                            <div className="space-y-1.5 pt-0.5">
+                                <button
+                                    type="button"
+                                    onClick={() => setShowCustomWaMessage(!showCustomWaMessage)}
+                                    className="text-[11px] text-amber-800 dark:text-amber-300 underline hover:no-underline font-medium inline-block"
+                                >
+                                    {showCustomWaMessage ? "Hide message preview / customization" : "Customize message before sending"}
+                                </button>
+                                {showCustomWaMessage && (
+                                    <div className="space-y-1 pt-1">
+                                        <textarea
+                                            value={customWaMessage}
+                                            onChange={(e) => setCustomWaMessage(e.target.value)}
+                                            placeholder="Leave empty to use global telephony configuration default message"
+                                            rows={3}
+                                            className="w-full text-xs p-2 rounded border bg-background text-foreground resize-y focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-amber-500"
+                                        />
+                                        <div className="text-[10px] text-muted-foreground">
+                                            Leave empty to use the default message configured in Telephony Configuration.
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
+                            <Button
+                                type="button"
+                                variant="outline"
+                                size="sm"
+                                className="h-7 text-xs bg-amber-500/20 border-amber-500/40 hover:bg-amber-500/30 text-amber-900 dark:text-amber-200"
+                                disabled={requestingWaPermission}
+                                onClick={handleRequestWhatsAppPermission}
+                            >
+                                {requestingWaPermission ? (
+                                    <>
+                                        <Loader2 className="h-3 w-3 animate-spin mr-1.5" />
+                                        Sending Request...
+                                    </>
+                                ) : (
+                                    "Send Permission Request via WhatsApp"
+                                )}
+                            </Button>
+                        </div>
+                    )}
+                </div>
+            )}
+            {callStatus !== "idle" && (
+                <div className="rounded-lg border p-4 my-3 flex flex-col items-center justify-center space-y-2 bg-muted/20">
+                    {callStatus === "calling" && (
+                        <div className="flex flex-col items-center space-y-2 text-center py-1">
+                            <div className="flex items-center gap-2">
+                                <span className="relative flex h-3 w-3">
+                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-amber-400 opacity-75"></span>
+                                    <span className="relative inline-flex rounded-full h-3 w-3 bg-amber-500"></span>
+                                </span>
+                                <span className="text-sm font-medium text-amber-700 dark:text-amber-400">
+                                    Calling {phoneNumber}...
+                                </span>
+                            </div>
+                            <p className="text-xs text-muted-foreground">Waiting for recipient to answer...</p>
+                        </div>
+                    )}
+
+                    {callStatus === "connected" && (
+                        <div className="flex flex-col items-center space-y-2 text-center py-1">
+                            <div className="flex items-center gap-2">
+                                <span className="relative flex h-3 w-3">
+                                    <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                                    <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
+                                </span>
+                                <span className="text-sm font-semibold text-emerald-700 dark:text-emerald-400">
+                                    Call In Progress
+                                </span>
+                            </div>
+                            <div className="flex items-center gap-2 text-3xl font-mono font-bold tracking-widest text-foreground py-1">
+                                <Clock className="h-6 w-6 text-muted-foreground" />
+                                <span>{formatDuration(callDuration)}</span>
+                            </div>
+                        </div>
+                    )}
+
+                    {callStatus === "ended" && (
+                        <div className="flex flex-col items-center space-y-1 text-center py-1">
+                            <div className="flex items-center gap-2">
+                                <span className="inline-flex rounded-full h-2.5 w-2.5 bg-zinc-400"></span>
+                                <span className="text-sm font-medium text-muted-foreground">
+                                    Call Ended
+                                </span>
+                            </div>
+                            <p className="text-xs font-mono text-muted-foreground">
+                                Call duration: {formatDuration(callDuration)}
+                            </p>
+                        </div>
+                    )}
+
+                    {callStatus === "failed" && (
+                        <div className="flex flex-col items-center space-y-1 text-center py-1">
+                            <div className="flex items-center gap-2">
+                                <span className="inline-flex rounded-full h-2.5 w-2.5 bg-destructive"></span>
+                                <span className="text-sm font-medium text-destructive">
+                                    Call Terminated / Failed
+                                </span>
+                            </div>
+                        </div>
+                    )}
+                </div>
+            )}
             <DialogFooter className="flex-col sm:flex-row gap-2">
                 <Button
                     variant="outline"
@@ -561,30 +1124,81 @@ export const PhoneCallDialog = ({
                     Configure Telephony
                 </Button>
                 <div className="flex gap-2 flex-1 justify-end">
-                    <DialogClose asChild>
-                        <Button variant="outline">Cancel</Button>
-                    </DialogClose>
-                    {!callSuccessMsg ? (
-                        <Button
-                            onClick={handleStartCall}
-                            disabled={callLoading || !phoneNumber || selectedConfigBlocked}
-                        >
-                            {callLoading ? "Calling..." : "Start Call"}
-                        </Button>
+                    {callStatus === "idle" && (
+                        <DialogClose asChild>
+                            <Button variant="outline">Cancel</Button>
+                        </DialogClose>
+                    )}
+                    {callStatus === "idle" ? (
+                        isWhatsApp && waPermissionStatus !== "granted" ? (
+                            <TooltipProvider>
+                                <Tooltip>
+                                    <TooltipTrigger asChild>
+                                        <span
+                                            tabIndex={0}
+                                            className="inline-block cursor-not-allowed"
+                                        >
+                                            <Button
+                                                disabled
+                                                className="pointer-events-none"
+                                            >
+                                                Start Call
+                                            </Button>
+                                        </span>
+                                    </TooltipTrigger>
+                                    <TooltipContent side="top" className="max-w-xs text-center">
+                                        {waPermissionStatus === "restricted"
+                                            ? waRestrictedReason || "WhatsApp outbound calling is not supported in this destination country."
+                                            : "Recipient must grant call permission on WhatsApp before calling."}
+                                    </TooltipContent>
+                                </Tooltip>
+                            </TooltipProvider>
+                        ) : (
+                            <Button
+                                onClick={handleStartCall}
+                                disabled={callLoading || !phoneNumber || selectedConfigBlocked}
+                            >
+                                {callLoading ? "Calling..." : "Start Call"}
+                            </Button>
+                        )
                     ) : (
                         <>
-                            <Button variant="outline" onClick={() => { setCallSuccessMsg(null); setCallError(null); }}>
+                            <Button
+                                variant="outline"
+                                onClick={handleResetCall}
+                                disabled={callStatus === "calling" || callStatus === "connected"}
+                            >
                                 Call Again
                             </Button>
-                            <Button onClick={() => onOpenChange(false)}>
-                                Close
-                            </Button>
+                            {(callStatus === "calling" || callStatus === "connected") ? (
+                                <Button
+                                    variant="destructive"
+                                    onClick={handleEndCall}
+                                    disabled={endingCall}
+                                >
+                                    {endingCall ? (
+                                        <>
+                                            <Loader2 className="h-4 w-4 animate-spin mr-1.5" />
+                                            Ending...
+                                        </>
+                                    ) : (
+                                        <>
+                                            <PhoneOff className="h-4 w-4 mr-1.5" />
+                                            End Call
+                                        </>
+                                    )}
+                                </Button>
+                            ) : (
+                                <Button onClick={() => onOpenChange(false)}>
+                                    Close
+                                </Button>
+                            )}
                         </>
                     )}
                 </div>
             </DialogFooter>
-            {callError && <div className="text-red-500 text-sm mt-2">{callError}</div>}
-            {callSuccessMsg && <div className="text-green-600 text-sm mt-2">{callSuccessMsg}</div>}
+            {callError && <div className="text-red-500 text-sm mt-2 break-all break-words max-w-full">{callError}</div>}
+            {callSuccessMsg && callStatus === "idle" && <div className="text-green-600 text-sm mt-2 break-all break-words max-w-full">{callSuccessMsg}</div>}
         </>
     );
 

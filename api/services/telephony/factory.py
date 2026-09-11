@@ -325,6 +325,8 @@ async def _normalize_with_phone_numbers(
 
     addresses = await db_client.list_active_normalized_addresses_for_config(row.id)
     base["from_numbers"] = addresses
+    base["telephony_configuration_id"] = row.id
+    base["organization_id"] = row.organization_id
 
     default_row = await db_client.get_default_caller_id(row.id)
     # Membership in the active-address list also guards against a default

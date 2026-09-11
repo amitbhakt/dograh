@@ -80,6 +80,7 @@ def register_event_handlers(
     user_provider_id: str | None = None,
     integration_runtime_sessions: list[IntegrationRuntimeSession] | None = None,
     include_transcript_end_timestamps: bool = False,
+    call_answered_event: asyncio.Event | None = None,
 ):
     """Register all event handlers for transport and task events.
 
@@ -177,6 +178,19 @@ def register_event_handlers(
     @transport.event_handler("on_client_connected")
     async def on_client_connected(_transport, _participant):
         logger.debug("In on_client_connected callback handler")
+        if call_answered_event is not None and not call_answered_event.is_set():
+            logger.info(
+                f"[run_id={workflow_run_id}] WebRTC connected but awaiting remote call answer before starting speech..."
+            )
+            await call_answered_event.wait()
+            logger.info(
+                f"[run_id={workflow_run_id}] Remote call answer confirmed, starting speech and audio recording."
+            )
+            if engine.is_call_disposed():
+                logger.info(
+                    f"[run_id={workflow_run_id}] Call already disposed before speech could start, aborting initial response."
+                )
+                return
         await audio_buffer.start_recording()
         ready_state["client_connected"] = True
         await maybe_trigger_initial_response()

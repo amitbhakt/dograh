@@ -1,16 +1,77 @@
 import json
+import re
 from datetime import UTC, datetime
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import func, text, update
+from sqlalchemy import cast, func, or_, String, text, update
 from sqlalchemy.future import select
 
 from api.db.base_client import BaseDBClient
 from api.db.filters import apply_workflow_run_filters, get_workflow_run_order_clause
 from api.db.models import CampaignModel, QueuedRunModel, WorkflowRunModel
+from api.enums import TelephonyCallStatus, WorkflowRunState
 from api.schemas.workflow import WorkflowRunResponseSchema
 from api.services.workflow.run_usage_response import format_public_cost_info
 from api.utils.recording_artifacts import get_recording_storage_key
+from api.utils.telephony_address import normalize_telephony_address
+
+
+def is_same_recipient_number(
+    candidate: str,
+    target_digits: str,
+    target_canonical: str,
+    target_no_plus: str,
+) -> bool:
+    """Decide whether a stored phone number refers to the same recipient as the target.
+
+    Campaign leads arrive in whatever shape the customer uploaded them - with or
+    without a country code, with or without punctuation - so equality alone is
+    not enough. The target derivations are passed in precomputed because this
+    runs once per candidate row.
+    """
+    if not candidate:
+        return False
+
+    candidate_digits = re.sub(r"\D", "", candidate)
+
+    # 1. Exact digit match (e.g. 15551234567 == 15551234567)
+    if candidate_digits and candidate_digits == target_digits:
+        return True
+
+    # 2. Suffix match when one side carries a country code and the other does not.
+    # Two bounds keep this from reaching a different subscriber:
+    #  - the shorter side must be long enough to be a phone number in its own
+    #    right. 8 is normalize_telephony_address's own floor (_PSTN_DIGITS_RE is
+    #    8-15); below it we are looking at a local fragment with no area code,
+    #    and any longer number ending in those digits would match.
+    #  - the surplus must be shaped like a country code: 1-3 digits, never
+    #    leading with 0 (that is a national trunk prefix, not a dial code).
+    # This is still a heuristic - leads arrive without a country - so it is
+    # deliberately the narrowest rule that keeps "same number, no country code"
+    # working, not a general equivalence test.
+    if candidate_digits and target_digits:
+        if len(candidate_digits) >= len(target_digits):
+            longer, shorter = candidate_digits, target_digits
+        else:
+            longer, shorter = target_digits, candidate_digits
+        surplus = longer[: len(longer) - len(shorter)]
+        if (
+            len(shorter) >= 8
+            and 0 < len(surplus) <= 3
+            and not surplus.startswith("0")
+            and longer.endswith(shorter)
+        ):
+            return True
+
+    # 3. Canonical match using normalize_telephony_address
+    try:
+        if normalize_telephony_address(candidate).canonical == target_canonical:
+            return True
+    except Exception:
+        pass
+
+    # 4. Leading plus-stripped string match
+    return candidate.lstrip("+") == target_no_plus
 
 
 class CampaignClient(BaseDBClient):
@@ -27,6 +88,7 @@ class CampaignClient(BaseDBClient):
         schedule_config: Optional[dict] = None,
         circuit_breaker: Optional[dict] = None,
         telephony_configuration_id: Optional[int] = None,
+        whatsapp_permission_action: Optional[str] = "skip",
     ) -> CampaignModel:
         """Create a new campaign"""
         async with self.async_session() as session:
@@ -38,6 +100,10 @@ class CampaignClient(BaseDBClient):
                 orchestrator_metadata["schedule_config"] = schedule_config
             if circuit_breaker is not None:
                 orchestrator_metadata["circuit_breaker"] = circuit_breaker
+            if whatsapp_permission_action is not None:
+                orchestrator_metadata["whatsapp_permission_action"] = (
+                    whatsapp_permission_action
+                )
 
             campaign = CampaignModel(
                 name=name,
@@ -749,6 +815,25 @@ class CampaignClient(BaseDBClient):
             result = await session.execute(query)
             return result.scalar() or 0
 
+    async def get_claimable_queued_runs_count(
+        self,
+        campaign_id: int,
+        before: Optional[datetime] = None,
+    ) -> int:
+        """Get count of queued runs that are claimable right now (unscheduled or scheduled <= before)."""
+        now = before or datetime.now(UTC)
+        async with self.async_session() as session:
+            query = select(func.count(QueuedRunModel.id)).where(
+                QueuedRunModel.campaign_id == campaign_id,
+                QueuedRunModel.state == "queued",
+                or_(
+                    QueuedRunModel.scheduled_for.is_(None),
+                    QueuedRunModel.scheduled_for <= now,
+                ),
+            )
+            result = await session.execute(query)
+            return result.scalar() or 0
+
     async def get_scheduled_runs_count(
         self,
         campaign_id: int,
@@ -850,3 +935,161 @@ class CampaignClient(BaseDBClient):
                 await session.refresh(run)
 
             return claimed_runs
+
+    async def get_queued_runs_awaiting_whatsapp_permission(
+        self, phone_number: str
+    ) -> List[QueuedRunModel]:
+        """Find active queued runs waiting for WhatsApp call permission from this phone number."""
+        if not phone_number:
+            return []
+
+        raw_trimmed = phone_number.strip()
+        target_digits = re.sub(r"\D", "", raw_trimmed)
+        if not target_digits:
+            return []
+
+        try:
+            target_canonical = normalize_telephony_address(raw_trimmed).canonical
+        except Exception:
+            target_canonical = f"+{target_digits}"
+
+        target_no_plus = target_canonical.lstrip("+")
+
+        # Build candidate filter conditions for SQL-level filtering to avoid
+        # loading all parked runs into memory.
+        candidate_filters = [
+            QueuedRunModel.context_variables["phone_number"].as_string() == raw_trimmed,
+            QueuedRunModel.context_variables["phone_number"].as_string() == target_digits,
+            QueuedRunModel.context_variables["phone_number"].as_string() == f"+{target_digits}",
+            QueuedRunModel.context_variables["phone_number"].as_string() == target_canonical,
+            QueuedRunModel.context_variables["phone_number"].as_string() == target_no_plus,
+        ]
+
+        # Add substring/suffix filter on context_variables JSON text to catch
+        # formatted variants (e.g. "+1 (555) 123-4567" or "1-555-123-4567"),
+        # where punctuation stops the full digit string from appearing verbatim.
+        # These are a deliberately wide *prefilter* only: every row they return
+        # is re-checked below against context_variables["phone_number"] alone,
+        # so a digit run matching some other field never survives.
+        if len(target_digits) >= 7:
+            candidate_filters.append(
+                cast(QueuedRunModel.context_variables, String).ilike(f"%{target_digits[-7:]}%")
+            )
+        if len(target_digits) >= 4:
+            candidate_filters.append(
+                cast(QueuedRunModel.context_variables, String).ilike(f"%{target_digits[-4:]}%")
+            )
+
+        async with self.async_session() as session:
+            query = select(QueuedRunModel).where(
+                QueuedRunModel.state == "queued",
+                QueuedRunModel.retry_reason == "awaiting_whatsapp_permission",
+                or_(*candidate_filters),
+            )
+            result = await session.execute(query)
+            runs = list(result.scalars().all())
+
+            # Robust matching in Python across formatting differences. Only
+            # context_variables["phone_number"] is consulted, so a row the broad
+            # ILIKE prefilter pulled in on some other field is discarded here.
+            return [
+                r
+                for r in runs
+                if is_same_recipient_number(
+                    str((r.context_variables or {}).get("phone_number") or "").strip(),
+                    target_digits=target_digits,
+                    target_canonical=target_canonical,
+                    target_no_plus=target_no_plus,
+                )
+            ]
+
+    async def get_all_queued_runs_awaiting_whatsapp_permission(
+        self, campaign_id: Optional[int] = None
+    ) -> List[QueuedRunModel]:
+        """Find all active queued runs waiting for WhatsApp call permission across campaigns or for a specific campaign."""
+        async with self.async_session() as session:
+            conditions = [
+                QueuedRunModel.state == "queued",
+                QueuedRunModel.retry_reason == "awaiting_whatsapp_permission",
+            ]
+            if campaign_id is not None:
+                conditions.append(QueuedRunModel.campaign_id == campaign_id)
+            query = select(QueuedRunModel).where(*conditions)
+            result = await session.execute(query)
+            return list(result.scalars().all())
+
+    async def activate_queued_run_for_immediate_dial(
+        self, queued_run_id: int
+    ) -> Optional[QueuedRunModel]:
+        """Clears scheduled_for so the run is picked up in the next campaign batch,
+        and removes awaiting_permission disposition on the linked workflow run."""
+        async with self.async_session() as session:
+            run = await session.get(QueuedRunModel, queued_run_id)
+            if not run:
+                return None
+            run.scheduled_for = None
+            run.retry_reason = "permission_granted"
+
+            # Reset awaiting_permission disposition on existing workflow run so UI
+            # immediately reverts to the default condition for a live/in-flight run
+            wf_query = (
+                select(WorkflowRunModel)
+                .where(WorkflowRunModel.queued_run_id == queued_run_id)
+                .order_by(WorkflowRunModel.created_at.desc())
+            )
+            wf_result = await session.execute(wf_query)
+            wf_run = wf_result.scalars().first()
+            if wf_run and not wf_run.is_completed:
+                ctx = dict(wf_run.gathered_context or {})
+                ctx.pop("call_disposition", None)
+                ctx.pop("mapped_call_disposition", None)
+                ctx.pop("call_status", None)
+                ctx.pop("error", None)
+                wf_run.gathered_context = ctx
+                from sqlalchemy.orm.attributes import flag_modified
+
+                flag_modified(wf_run, "gathered_context")
+
+            await session.commit()
+            await session.refresh(run)
+            return run
+
+    async def fail_queued_run_permission_denied(
+        self, queued_run_id: int
+    ) -> Optional[QueuedRunModel]:
+        """Marks a queued run as failed when recipient denies WhatsApp call permission."""
+        async with self.async_session() as session:
+            run = await session.get(QueuedRunModel, queued_run_id)
+            if not run:
+                return None
+
+            if run.state not in ("failed", "processed"):
+                if run.campaign_id:
+                    campaign = await session.get(CampaignModel, run.campaign_id)
+                    if campaign:
+                        campaign.processed_rows = (campaign.processed_rows or 0) + 1
+                        campaign.failed_rows = (campaign.failed_rows or 0) + 1
+
+            run.state = "failed"
+            run.retry_reason = "permission_denied"
+            run.processed_at = datetime.now(UTC)
+            wf_query = (
+                select(WorkflowRunModel)
+                .where(WorkflowRunModel.queued_run_id == queued_run_id)
+                .order_by(WorkflowRunModel.created_at.desc())
+            )
+            wf_result = await session.execute(wf_query)
+            wf_run = wf_result.scalars().first()
+            if wf_run and not wf_run.is_completed:
+                wf_run.is_completed = True
+                wf_run.state = WorkflowRunState.COMPLETED.value
+                wf_run.gathered_context = {
+                    **(wf_run.gathered_context or {}),
+                    "call_disposition": TelephonyCallStatus.PERMISSION_DENIED.value,
+                    "mapped_call_disposition": TelephonyCallStatus.PERMISSION_DENIED.value,
+                    "call_status": TelephonyCallStatus.PERMISSION_DENIED.value,
+                    "error": "WhatsApp call permission was denied by recipient",
+                }
+            await session.commit()
+            await session.refresh(run)
+            return run

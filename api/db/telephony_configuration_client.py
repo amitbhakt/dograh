@@ -6,14 +6,75 @@ Each row represents one provider account that an organization has connected
 """
 
 from datetime import UTC, datetime
+import re
 from typing import Any, Dict, List, Optional
 
+from loguru import logger
 from sqlalchemy import func, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.future import select
 
 from api.db.base_client import BaseDBClient
-from api.db.models import CampaignModel, TelephonyConfigurationModel
+from api.db.models import (
+    CampaignModel,
+    TelephonyConfigurationModel,
+    TelephonyPhoneNumberModel,
+    WhatsAppCallPermissionModel,
+)
+from api.utils.telephony_address import normalize_telephony_address
+
+
+def _get_recipient_number_candidates(recipient_phone_number: str) -> list[str]:
+    raw = recipient_phone_number.strip()
+    digits = re.sub(r"\D", "", raw)
+    candidates = [raw, raw.lstrip("+")]
+    if digits:
+        candidates.extend([digits, f"+{digits}"])
+    try:
+        canonical = normalize_telephony_address(raw).canonical
+        candidates.extend([canonical, canonical.lstrip("+")])
+    except Exception:
+        pass
+    return list(dict.fromkeys([c for c in candidates if c]))
+
+
+def _canonical_recipient_number(recipient_phone_number: str) -> str:
+    """Reduce a recipient number to the single form permission rows are keyed by.
+
+    uq_whatsapp_perm_config_recipient is a constraint on the stored string, so it
+    only prevents duplicates if every writer stores the same spelling. Storing
+    whatever the caller happened to pass would key the row on its arrival format:
+    a row written as "+44 7123 456789" is invisible to a later lookup for
+    "+447123456789", which then inserts a second row for the same recipient.
+    This form is always in _get_recipient_number_candidates, so existing lookups
+    keep finding it.
+    """
+    raw = recipient_phone_number.strip()
+    try:
+        return normalize_telephony_address(raw).canonical
+    except Exception:
+        digits = re.sub(r"\D", "", raw)
+        return f"+{digits}" if digits else raw
+
+
+async def _select_permission_row(session, query, recipient_phone_number: str):
+    """Pick one permission row, deterministically, and surface any duplicates.
+
+    Rows written before recipients were stored canonically may still exist under
+    several spellings, and the unique constraint cannot merge them because it
+    constrains the stored string. Ordering by id makes every reader agree on the
+    same row instead of taking an arbitrary one, so permission checks and webhook
+    updates cannot drift onto different records for the same recipient.
+    """
+    result = await session.execute(query.order_by(WhatsAppCallPermissionModel.id))
+    rows = list(result.scalars().all())
+    if len(rows) > 1:
+        logger.warning(
+            f"[WhatsApp Permission] {len(rows)} rows share recipient {recipient_phone_number} "
+            f"(ids={[r.id for r in rows]}); using {rows[0].id}. These predate canonical "
+            "recipient storage and should be merged."
+        )
+    return rows[0] if rows else None
 
 
 class TelephonyConfigurationInUseError(Exception):
@@ -180,6 +241,106 @@ class TelephonyConfigurationClient(BaseDBClient):
             )
             return list(result.scalars().all())
 
+    async def get_whatsapp_configuration_by_phone_number_id(
+        self, phone_number_id: str
+    ) -> Optional[TelephonyConfigurationModel]:
+        """Look up an active WhatsApp telephony configuration by phone_number_id.
+
+        Matches either the phone_number_id stored directly in configuration
+        credentials or the phone_number_id stored in attached active phone
+        number extra_metadata (supporting WABA-level account setups).
+        """
+        async with self.async_session() as session:
+            # 1. Direct match on configuration credentials
+            stmt = select(TelephonyConfigurationModel).where(
+                TelephonyConfigurationModel.provider == "whatsapp",
+                TelephonyConfigurationModel.credentials.op("->>")(
+                    "phone_number_id"
+                )
+                == phone_number_id,
+                TelephonyConfigurationModel.inactive.is_(False),
+            )
+            result = await session.execute(stmt)
+            rows = result.scalars().all()
+            if len(rows) > 1:
+                ids = ", ".join(str(r.id) for r in rows)
+                logger.error(
+                    f"[WhatsApp] Ambiguous phone_number_id={phone_number_id!r}: "
+                    f"matches {len(rows)} active configurations ({ids}). "
+                    f"Rejecting inbound call to prevent wrong-tenant routing."
+                )
+                return None  # caller will reject the call
+            config = rows[0] if rows else None
+            if config:
+                return config
+
+            # 2. Match via attached phone number extra_metadata
+            stmt_phone = (
+                select(TelephonyConfigurationModel)
+                .join(
+                    TelephonyPhoneNumberModel,
+                    TelephonyPhoneNumberModel.telephony_configuration_id
+                    == TelephonyConfigurationModel.id,
+                )
+                .where(
+                    TelephonyConfigurationModel.provider == "whatsapp",
+                    TelephonyConfigurationModel.inactive.is_(False),
+                    TelephonyPhoneNumberModel.is_active.is_(True),
+                    (
+                        TelephonyPhoneNumberModel.extra_metadata.op("->>")(
+                            "phone_number_id"
+                        )
+                        == phone_number_id
+                    )
+                    | (
+                        TelephonyPhoneNumberModel.extra_metadata.op("->>")(
+                            "meta_phone_number_id"
+                        )
+                        == phone_number_id
+                    ),
+                )
+            )
+            result_phone = await session.execute(stmt_phone)
+            rows_phone = result_phone.scalars().all()
+            unique_configs = {r.id: r for r in rows_phone}
+            if len(unique_configs) > 1:
+                ids = ", ".join(str(cid) for cid in unique_configs.keys())
+                logger.error(
+                    f"[WhatsApp] Ambiguous phone_number_id={phone_number_id!r} via extra_metadata: "
+                    f"matches {len(unique_configs)} active configurations ({ids}). "
+                    f"Rejecting inbound call."
+                )
+                return None
+            return next(iter(unique_configs.values())) if unique_configs else None
+
+    async def get_active_whatsapp_configurations(
+        self,
+    ) -> list[TelephonyConfigurationModel]:
+        """Fetch all active WhatsApp telephony configurations."""
+        async with self.async_session() as session:
+            stmt = select(TelephonyConfigurationModel).where(
+                TelephonyConfigurationModel.provider == "whatsapp",
+                TelephonyConfigurationModel.inactive.is_(False),
+            )
+            result = await session.execute(stmt)
+            return list(result.scalars().all())
+
+    async def get_whatsapp_configuration_by_verify_token(
+        self, verify_token: str
+    ) -> Optional[TelephonyConfigurationModel]:
+        """Look up an active WhatsApp config matching a webhook verify token."""
+        async with self.async_session() as session:
+            stmt = select(TelephonyConfigurationModel).where(
+                TelephonyConfigurationModel.provider == "whatsapp",
+                TelephonyConfigurationModel.credentials.op("->>")(
+                    "webhook_verify_token"
+                )
+                == verify_token,
+                TelephonyConfigurationModel.inactive.is_(False),
+            )
+            result = await session.execute(stmt)
+            return result.scalars().first()
+
     async def set_telephony_configuration_inactive(
         self, config_id: int, organization_id: int, reason: str
     ) -> bool:
@@ -332,3 +493,192 @@ class TelephonyConfigurationClient(BaseDBClient):
             )
             .values(is_default_outbound=False)
         )
+
+    async def get_whatsapp_call_permission(
+        self, telephony_configuration_id: int, recipient_phone_number: str
+    ) -> Optional[WhatsAppCallPermissionModel]:
+        """Fetch WhatsApp call permission record by config ID and recipient number (with format tolerance)."""
+        candidates = _get_recipient_number_candidates(recipient_phone_number)
+        async with self.async_session() as session:
+            return await _select_permission_row(
+                session,
+                select(WhatsAppCallPermissionModel).where(
+                    WhatsAppCallPermissionModel.telephony_configuration_id == telephony_configuration_id,
+                    WhatsAppCallPermissionModel.recipient_phone_number.in_(candidates),
+                ),
+                recipient_phone_number,
+            )
+
+    async def get_whatsapp_call_permission_by_phone_id(
+        self, phone_number_id: str, recipient_phone_number: str
+    ) -> Optional[WhatsAppCallPermissionModel]:
+        """Fetch WhatsApp call permission record by Meta phone_number_id and recipient number (with format tolerance)."""
+        candidates = _get_recipient_number_candidates(recipient_phone_number)
+        async with self.async_session() as session:
+            return await _select_permission_row(
+                session,
+                select(WhatsAppCallPermissionModel).where(
+                    WhatsAppCallPermissionModel.phone_number_id == phone_number_id,
+                    WhatsAppCallPermissionModel.recipient_phone_number.in_(candidates),
+                ),
+                recipient_phone_number,
+            )
+
+    async def upsert_whatsapp_call_permission(
+        self,
+        organization_id: int,
+        telephony_configuration_id: int,
+        phone_number_id: str,
+        recipient_phone_number: str,
+        status: str,
+        permission_type: Optional[str] = None,
+        meta_message_id: Optional[str] = None,
+        expires_at: Optional[datetime] = None,
+        granted_at: Optional[datetime] = None,
+    ) -> WhatsAppCallPermissionModel:
+        """Create or update a WhatsApp call permission record, handling concurrency races."""
+        candidates = _get_recipient_number_candidates(recipient_phone_number)
+        canonical_recipient = _canonical_recipient_number(recipient_phone_number)
+        async with self.async_session() as session:
+            try:
+                row = await _select_permission_row(
+                    session,
+                    select(WhatsAppCallPermissionModel).where(
+                        WhatsAppCallPermissionModel.telephony_configuration_id == telephony_configuration_id,
+                        WhatsAppCallPermissionModel.recipient_phone_number.in_(candidates),
+                    ),
+                    recipient_phone_number,
+                )
+                now = datetime.now(UTC)
+                if row is None:
+                    row = WhatsAppCallPermissionModel(
+                        organization_id=organization_id,
+                        telephony_configuration_id=telephony_configuration_id,
+                        phone_number_id=phone_number_id,
+                        recipient_phone_number=canonical_recipient,
+                        status=status,
+                        permission_type=permission_type,
+                        meta_message_id=meta_message_id,
+                        requested_at=now,
+                        granted_at=granted_at,
+                        expires_at=expires_at,
+                        updated_at=now,
+                    )
+                    session.add(row)
+                else:
+                    row.status = status
+                    row.phone_number_id = phone_number_id
+                    if permission_type is not None:
+                        row.permission_type = permission_type
+                    if meta_message_id is not None:
+                        row.meta_message_id = meta_message_id
+                    if expires_at is not None:
+                        row.expires_at = expires_at
+                    if granted_at is not None:
+                        row.granted_at = granted_at
+                    row.updated_at = now
+
+                await session.commit()
+                await session.refresh(row)
+                return row
+            except IntegrityError:
+                await session.rollback()
+                # Concurrency race: another transaction inserted for this recipient
+                logger.info(
+                    f"[WhatsApp Permission] Concurrency race detected for recipient {recipient_phone_number} "
+                    f"in configuration {telephony_configuration_id}; retrying as update"
+                )
+                row = await _select_permission_row(
+                    session,
+                    select(WhatsAppCallPermissionModel).where(
+                        WhatsAppCallPermissionModel.telephony_configuration_id == telephony_configuration_id,
+                        WhatsAppCallPermissionModel.recipient_phone_number.in_(candidates),
+                    ),
+                    recipient_phone_number,
+                )
+                if row is not None:
+                    now = datetime.now(UTC)
+                    row.status = status
+                    row.phone_number_id = phone_number_id
+                    if permission_type is not None:
+                        row.permission_type = permission_type
+                    if meta_message_id is not None:
+                        row.meta_message_id = meta_message_id
+                    if expires_at is not None:
+                        row.expires_at = expires_at
+                    if granted_at is not None:
+                        row.granted_at = granted_at
+                    row.updated_at = now
+                    await session.commit()
+                    await session.refresh(row)
+                    return row
+                raise
+
+    async def update_whatsapp_call_permission_status_by_wa_id(
+        self,
+        phone_number_id: str,
+        recipient_phone_number: str,
+        status: str,
+        permission_type: Optional[str] = None,
+        expires_at: Optional[datetime] = None,
+        granted_at: Optional[datetime] = None,
+    ) -> Optional[WhatsAppCallPermissionModel]:
+        """Update permission status by Meta phone_number_id and recipient number (e.g. from webhooks)."""
+        candidates = _get_recipient_number_candidates(recipient_phone_number)
+        async with self.async_session() as session:
+            row = await _select_permission_row(
+                session,
+                select(WhatsAppCallPermissionModel).where(
+                    WhatsAppCallPermissionModel.phone_number_id == phone_number_id,
+                    WhatsAppCallPermissionModel.recipient_phone_number.in_(candidates),
+                ),
+                recipient_phone_number,
+            )
+            if not row:
+                return None
+
+            row.status = status
+            if permission_type is not None:
+                row.permission_type = permission_type
+            if expires_at is not None:
+                row.expires_at = expires_at
+            if granted_at is not None:
+                row.granted_at = granted_at
+            row.updated_at = datetime.now(UTC)
+
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+    async def update_whatsapp_call_permission_status_by_message_id(
+        self,
+        meta_message_id: str,
+        status: str,
+        permission_type: Optional[str] = None,
+        expires_at: Optional[datetime] = None,
+        granted_at: Optional[datetime] = None,
+    ) -> Optional[WhatsAppCallPermissionModel]:
+        """Update permission status by Meta message ID (e.g. from messages status or reply webhook)."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                select(WhatsAppCallPermissionModel).where(
+                    WhatsAppCallPermissionModel.meta_message_id == meta_message_id,
+                )
+            )
+            row = result.scalars().first()
+            if not row:
+                return None
+
+            row.status = status
+            if permission_type is not None:
+                row.permission_type = permission_type
+            if expires_at is not None:
+                row.expires_at = expires_at
+            if granted_at is not None:
+                row.granted_at = granted_at
+            row.updated_at = datetime.now(UTC)
+            await session.commit()
+            await session.refresh(row)
+            return row
+
+

@@ -68,6 +68,22 @@ class SIPConnectivityDetails:
     regions: list[SIPRegionDetails]
 
 
+class TelephonyPermissionRequiredError(Exception):
+    """Raised when an outbound call requires explicit recipient consent or permission before dialing."""
+
+    def __init__(
+        self,
+        message: str,
+        status: str = "missing",
+        can_request_permission: bool = True,
+        request_limit_reason: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.status = status
+        self.can_request_permission = can_request_permission
+        self.request_limit_reason = request_limit_reason
+
+
 class ProviderPhoneNumberLookupError(Exception):
     """The provider could not determine whether it owns a phone number.
 
@@ -473,6 +489,21 @@ class TelephonyProvider(ABC):
         don't support programmatic webhook configuration (e.g. ARI).
         """
         return ProviderSyncResult(ok=True)
+
+    async def send_call_permission_request(
+        self, to_number: str, **kwargs
+    ) -> Any:
+        """Ask ``to_number`` for permission to place a business-initiated call.
+
+        Only meaningful for providers whose platform gates outbound calls on
+        recipient consent (WhatsApp today). The default raises so that generic
+        callers get an explicit, attributable failure instead of silently
+        assuming a request went out - a campaign that parks a lead waiting on a
+        request nobody sent strands it until the timeout.
+        """
+        raise NotImplementedError(
+            f"{self.PROVIDER_NAME} cannot send call permission requests"
+        )
 
     async def provision_phone_number(self, address: str) -> ProviderSyncResult | None:
         """Provision ``address`` at the provider before storing it locally.

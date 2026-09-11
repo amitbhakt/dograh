@@ -15572,3 +15572,21 @@ export type AutoscaleMetricApiV1HealthAutoscaleMetricGetResponses = {
 };
 
 export type AutoscaleMetricApiV1HealthAutoscaleMetricGetResponse = AutoscaleMetricApiV1HealthAutoscaleMetricGetResponses[keyof AutoscaleMetricApiV1HealthAutoscaleMetricGetResponses];
+
+export type SyncWhatsAppPermissionsApiV1CampaignCampaignIdSyncWhatsappPermissionsPostData = {
+    headers?: {
+        authorization?: string | null;
+    };
+    path: {
+        campaign_id: number;
+    };
+    url: '/api/v1/campaign/{campaign_id}/sync-whatsapp-permissions';
+};
+
+export type SyncWhatsAppPermissionsApiV1CampaignCampaignIdSyncWhatsappPermissionsPostResponses = {
+    200: {
+        success: boolean;
+        campaign_id: number;
+        reactivated_count: number;
+    };
+};
