@@ -458,6 +458,17 @@ class WhatsAppCallPermissionModel(Base):
             name="uq_whatsapp_perm_config_recipient",
         ),
         Index("ix_whatsapp_perm_lookup", "phone_number_id", "recipient_phone_number"),
+        # Every permission-message status/reply webhook resolves the row by the
+        # Meta message id alone, so without this the callback scans the table.
+        # meta_message_id is only populated while a request is outstanding, so a
+        # partial index keeps it to the small pending slice. Deliberately not
+        # unique: correctness of the webhook path must not depend on Meta never
+        # replaying a wamid across rows.
+        Index(
+            "ix_whatsapp_perm_meta_message_id",
+            "meta_message_id",
+            postgresql_where=text("meta_message_id IS NOT NULL"),
+        ),
     )
 
 
@@ -717,6 +728,19 @@ class WorkflowRunModel(Base):
         ),
         Index("idx_workflow_runs_workflow_id", "workflow_id"),
         Index("idx_workflow_runs_campaign_id", "campaign_id"),
+        # get_workflow_run_by_queued_run_id (and the campaign-side lookups)
+        # filter on queued_run_id and take the newest row; the FK alone creates
+        # no index, so each per-lead dispatch scanned workflow_runs. created_at
+        # is trailing so the same index also satisfies the ORDER BY (Postgres
+        # scans the btree backwards for DESC). Partial because only
+        # campaign-dispatched runs carry a queued_run_id, and every caller
+        # compares it for equality, which never matches NULL.
+        Index(
+            "idx_workflow_runs_queued_run_id",
+            "queued_run_id",
+            "created_at",
+            postgresql_where=text("queued_run_id IS NOT NULL"),
+        ),
     )
 
 

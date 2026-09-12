@@ -561,8 +561,13 @@ async def sync_campaign_whatsapp_permissions(
     from api.services.telephony.providers.whatsapp.routes import (
         sync_whatsapp_permissions_for_campaign,
     )
+
+    # force=False keeps the helper's 30s per-campaign Redis cooldown. Each sync
+    # issues one Meta Graph API call per parked recipient inline in this request,
+    # so a forced sync let repeated clicks burn Meta rate limits and pin request
+    # workers. Within the cooldown the helper returns 0 immediately.
     reactivated_count = await sync_whatsapp_permissions_for_campaign(
-        campaign_id, force=True
+        campaign_id, force=False
     )
     return {
         "success": True,
@@ -696,31 +701,32 @@ async def update_campaign(
     if request.retry_config is not None:
         update_kwargs["retry_config"] = request.retry_config.model_dump()
 
-    # Merge max_concurrency and schedule_config into orchestrator_metadata
-    metadata = campaign.orchestrator_metadata or {}
-    metadata_changed = False
+    # Only the keys this request actually changes, merged SQL-side. Reading the
+    # document and writing it back whole - even from a fresh read - loses any
+    # key a concurrent update writes in between; the jsonb merge cannot.
+    metadata_updates = {}
 
     if request.max_concurrency is not None:
-        metadata["max_concurrency"] = request.max_concurrency
-        metadata_changed = True
+        metadata_updates["max_concurrency"] = request.max_concurrency
 
     if request.schedule_config is not None:
-        metadata["schedule_config"] = request.schedule_config.model_dump()
-        metadata_changed = True
+        metadata_updates["schedule_config"] = request.schedule_config.model_dump()
 
     if request.circuit_breaker is not None:
-        metadata["circuit_breaker"] = request.circuit_breaker.model_dump()
-        metadata_changed = True
+        metadata_updates["circuit_breaker"] = request.circuit_breaker.model_dump()
 
     if request.whatsapp_permission_action is not None:
-        metadata["whatsapp_permission_action"] = request.whatsapp_permission_action
-        metadata_changed = True
-
-    if metadata_changed:
-        update_kwargs["orchestrator_metadata"] = metadata
+        metadata_updates["whatsapp_permission_action"] = (
+            request.whatsapp_permission_action
+        )
 
     if update_kwargs:
         await db_client.update_campaign(campaign_id=campaign_id, **update_kwargs)
+
+    if metadata_updates:
+        await db_client.merge_campaign_orchestrator_metadata(
+            campaign_id=campaign_id, updates=metadata_updates
+        )
 
     # Re-fetch to return updated data
     campaign = await db_client.get_campaign(campaign_id, user.selected_organization_id)

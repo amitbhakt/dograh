@@ -38,6 +38,7 @@ from api.services.telephony.call_transfer_manager import get_call_transfer_manag
 from api.services.telephony.factory import (
     get_all_telephony_providers,
     get_telephony_provider_by_id,
+    get_telephony_provider_for_active_call,
     get_telephony_provider_for_run,
 )
 from api.services.telephony.outbound_readiness import (
@@ -422,30 +423,80 @@ async def end_workflow_run_call(
         raise HTTPException(status_code=404, detail="Workflow run not found")
 
     call_id = (run.gathered_context or {}).get("call_id")
-    provider_name = (run.gathered_context or {}).get("provider") or run.mode
 
-    if provider_name == "whatsapp" or (call_id and str(call_id).startswith("wacid.")):
-        from api.services.telephony.providers.whatsapp.routes import terminate_whatsapp_call_by_id
-        if call_id:
-            await terminate_whatsapp_call_by_id(
-                call_id, workflow_run_id, user.selected_organization_id
-            )
-        else:
-            await db_client.update_workflow_run(
-                run.id,
-                is_completed=True,
-                state=WorkflowRunState.COMPLETED.value,
-            )
-            await call_concurrency.release_workflow_run_slot(run.id)
-    else:
+    # No call was ever placed, so there is nothing at the carrier to hang up and
+    # local bookkeeping is the whole job.
+    if not call_id:
         await db_client.update_workflow_run(
             run.id,
             is_completed=True,
             state=WorkflowRunState.COMPLETED.value,
         )
         await call_concurrency.release_workflow_run_slot(run.id)
+        return {"status": "success", "message": "Call ended successfully"}
 
-    return {"status": "success", "message": "Call ended successfully"}
+    # Anchored to the provider that actually placed the call. Resolving through
+    # get_telephony_provider_for_run would fall back to the org's current
+    # default for legacy runs, so a Twilio call in a WhatsApp-default org would
+    # be "ended" by asking Meta about a call id it has never seen.
+    provider = await get_telephony_provider_for_active_call(
+        run, user.selected_organization_id
+    )
+    if provider is None:
+        await db_client.update_workflow_run(
+            run.id,
+            is_completed=True,
+            state=WorkflowRunState.COMPLETED.value,
+        )
+        await call_concurrency.release_workflow_run_slot(run.id)
+        return {
+            "status": "partial",
+            "provider_terminated": False,
+            "message": (
+                "The run was closed, but the telephony provider that placed "
+                "this call could not be identified, so the carrier was not "
+                "asked to hang up. End the call from the handset if it is "
+                "still connected."
+            ),
+        }
+
+    try:
+        provider_terminated = await provider.end_call(
+            call_id=call_id,
+            workflow_run_id=run.id,
+            organization_id=user.selected_organization_id,
+        )
+    except NotImplementedError:
+        # Completing the run here would release the slot and report success
+        # while the recipient is still connected. Say so instead.
+        raise HTTPException(
+            status_code=501,
+            detail=(
+                f"Ending a call from the dashboard is not supported for "
+                f"{provider.PROVIDER_NAME}. Hang up from the handset; the run "
+                "will close when the call ends."
+            ),
+        )
+
+    if not provider_terminated:
+        # Local teardown ran, so the run is closed either way, but the carrier
+        # never confirmed. Saying "success" here is what lets the UI drop its
+        # retry path while the recipient is possibly still connected.
+        return {
+            "status": "partial",
+            "provider_terminated": False,
+            "message": (
+                "The call was closed on our side, but the provider did not "
+                "confirm the hang-up. If the recipient is still connected, end "
+                "the call from the handset."
+            ),
+        }
+
+    return {
+        "status": "success",
+        "provider_terminated": True,
+        "message": "Call ended successfully",
+    }
 
 
 @router.get("/webhook")

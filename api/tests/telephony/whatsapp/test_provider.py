@@ -95,9 +95,12 @@ class TestWhatsAppProvider(IsolatedAsyncioTestCase):
     async def test_initiate_call_permission_required(self):
         """Test initiate_call raises HTTPException when permission has not been granted."""
         provider = _provider(business_initiated_calls_enabled=True)
+        # provider.initiate_call imports the client factory, redis accessor and
+        # connection registry from .service at call time, so the service module -
+        # not .routes - is the binding a patch has to replace.
         with patch.object(db_client, "get_whatsapp_call_permission_by_phone_id", AsyncMock(return_value=None)), \
              patch.object(db_client, "get_whatsapp_call_permission", AsyncMock(return_value=None)), \
-             patch("api.services.telephony.providers.whatsapp.routes._get_or_create_whatsapp_client") as mock_get_client:
+             patch("api.services.telephony.providers.whatsapp.service.get_or_create_whatsapp_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.check_call_permission = AsyncMock(return_value={"can_call": False, "status": "not_requested"})
             mock_get_client.return_value = mock_client
@@ -116,7 +119,7 @@ class TestWhatsAppProvider(IsolatedAsyncioTestCase):
         provider = _provider(business_initiated_calls_enabled=True)
         with patch.object(db_client, "get_whatsapp_call_permission_by_phone_id", AsyncMock(return_value=None)), \
              patch.object(db_client, "get_whatsapp_call_permission", AsyncMock(return_value=None)), \
-             patch("api.services.telephony.providers.whatsapp.routes._get_or_create_whatsapp_client") as mock_get_client:
+             patch("api.services.telephony.providers.whatsapp.service.get_or_create_whatsapp_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.check_call_permission = AsyncMock(
                 return_value={
@@ -149,9 +152,9 @@ class TestWhatsAppProvider(IsolatedAsyncioTestCase):
         )
         with patch.object(db_client, "get_whatsapp_call_permission_by_phone_id", AsyncMock(return_value=mock_perm)), \
              patch.object(db_client, "get_whatsapp_call_permission", AsyncMock(return_value=mock_perm)), \
-             patch("api.services.telephony.providers.whatsapp.routes._get_or_create_whatsapp_client") as mock_get_client, \
-             patch("api.services.telephony.providers.whatsapp.routes.register_outbound_active_connection") as mock_reg, \
-             patch("api.services.telephony.providers.whatsapp.routes._get_redis", AsyncMock(return_value=None)):
+             patch("api.services.telephony.providers.whatsapp.service.get_or_create_whatsapp_client") as mock_get_client, \
+             patch("api.services.telephony.providers.whatsapp.service.register_outbound_active_connection") as mock_reg, \
+             patch("api.services.telephony.providers.whatsapp.service.get_whatsapp_redis", AsyncMock(return_value=None)):
             mock_client = MagicMock()
             mock_conn = MagicMock()
             mock_client.check_call_permission = AsyncMock(
@@ -182,7 +185,7 @@ class TestWhatsAppProvider(IsolatedAsyncioTestCase):
         mock_perm = MagicMock(status="granted_temporary", expires_at=None)
         with patch.object(db_client, "get_whatsapp_call_permission_by_phone_id", AsyncMock(return_value=mock_perm)), \
              patch.object(db_client, "get_whatsapp_call_permission", AsyncMock(return_value=mock_perm)), \
-             patch("api.services.telephony.providers.whatsapp.routes._get_or_create_whatsapp_client") as mock_get_client:
+             patch("api.services.telephony.providers.whatsapp.service.get_or_create_whatsapp_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.check_call_permission = AsyncMock(
                 return_value={"permission": {"status": "granted_temporary"}, "actions": [{"action_name": "start_call", "can_perform_action": True}]}
@@ -207,9 +210,9 @@ class TestWhatsAppProvider(IsolatedAsyncioTestCase):
         mock_perm = MagicMock(status="granted_temporary", expires_at=None)
         with patch.object(db_client, "get_whatsapp_call_permission_by_phone_id", AsyncMock(return_value=mock_perm)), \
              patch.object(db_client, "get_whatsapp_call_permission", AsyncMock(return_value=mock_perm)), \
-             patch("api.services.telephony.providers.whatsapp.routes._get_or_create_whatsapp_client") as mock_get_client, \
-             patch("api.services.telephony.providers.whatsapp.routes.register_outbound_active_connection", side_effect=RuntimeError("registration crashed")), \
-             patch("api.services.telephony.providers.whatsapp.routes._get_redis", AsyncMock(return_value=None)):
+             patch("api.services.telephony.providers.whatsapp.service.get_or_create_whatsapp_client") as mock_get_client, \
+             patch("api.services.telephony.providers.whatsapp.service.register_outbound_active_connection", side_effect=RuntimeError("registration crashed")), \
+             patch("api.services.telephony.providers.whatsapp.service.get_whatsapp_redis", AsyncMock(return_value=None)):
             mock_client = MagicMock()
             mock_conn = MagicMock()
             mock_conn.disconnect = AsyncMock()
@@ -234,13 +237,18 @@ class TestWhatsAppProvider(IsolatedAsyncioTestCase):
             mock_conn.disconnect.assert_called_once()
             mock_client.terminate_call.assert_called_once_with("call_wa_outbound_leak_test")
 
-    async def test_initiate_call_normalizes_meta_status_values(self):
-        """Test initiate_call normalizes Meta 'no_permission' status to 'denied' when upserting to DB."""
+    async def test_initiate_call_preserves_no_permission_status(self):
+        """Test initiate_call stores Meta 'no_permission' as-is, not as 'denied'.
+
+        The two are not interchangeable: reactivate_campaign_runs_for_recipient
+        hard-fails parked campaign runs on 'denied', so recording a recipient who
+        simply has not answered the prompt yet as 'denied' kills their lead.
+        """
         provider = _provider(business_initiated_calls_enabled=True)
         with patch.object(db_client, "get_whatsapp_call_permission_by_phone_id", AsyncMock(return_value=None)), \
              patch.object(db_client, "get_whatsapp_call_permission", AsyncMock(return_value=None)), \
              patch.object(db_client, "upsert_whatsapp_call_permission", AsyncMock()) as mock_upsert, \
-             patch("api.services.telephony.providers.whatsapp.routes._get_or_create_whatsapp_client") as mock_get_client:
+             patch("api.services.telephony.providers.whatsapp.service.get_or_create_whatsapp_client") as mock_get_client:
             mock_client = MagicMock()
             mock_client.check_call_permission = AsyncMock(
                 return_value={
@@ -262,7 +270,7 @@ class TestWhatsAppProvider(IsolatedAsyncioTestCase):
                 )
 
             mock_upsert.assert_called_once()
-            self.assertEqual(mock_upsert.call_args[1].get("status"), "denied")
+            self.assertEqual(mock_upsert.call_args[1].get("status"), "no_permission")
 
     def test_whatsapp_setup_checklist_outbound_readiness(self):
         """Test WhatsApp setup checklist resolver correctly computes ready_for_outbound."""
@@ -690,39 +698,25 @@ class TestWhatsAppProvider(IsolatedAsyncioTestCase):
             res = await provider.validate_phone_number("+15559999999")
             self.assertFalse(res.ok)
 
-    async def test_create_whatsapp_transport_success(self):
-        """Test create_transport constructs a valid FastAPIWebsocketTransport with 16 kHz audio config."""
-        from api.services.pipecat.audio_config import AudioConfig
+    async def test_whatsapp_websocket_transport_factory_refuses(self):
+        """WhatsApp media is WebRTC, so the WebSocket transport factory must refuse.
+
+        It used to build a real transport wired to a WhatsApp frame serializer
+        with its own hangup/transfer strategies - a second, never-executed call
+        teardown beside the real one. Asserting the refusal keeps anyone from
+        quietly reviving that path.
+        """
         from api.services.telephony.providers.whatsapp.transport import create_transport
 
-        mock_websocket = MagicMock()
-        audio_config = AudioConfig(
-            transport_in_sample_rate=16000,
-            transport_out_sample_rate=16000,
-            pipeline_sample_rate=16000,
-        )
-        mock_credentials = {
-            "access_token": "valid_token",
-            "phone_number_id": "12345",
-        }
-
-        with patch(
-            "api.services.telephony.providers.whatsapp.transport.load_credentials_for_transport",
-            AsyncMock(return_value=mock_credentials),
-        ), patch(
-            "api.services.telephony.providers.whatsapp.transport.build_audio_out_mixer",
-            AsyncMock(return_value=None),
-        ):
-            transport = await create_transport(
-                websocket=mock_websocket,
+        with self.assertRaises(NotImplementedError) as ctx:
+            await create_transport(
+                websocket=MagicMock(),
                 workflow_run_id=101,
-                audio_config=audio_config,
+                audio_config=MagicMock(),
                 organization_id=10,
                 call_id="call_test_123",
             )
-            self.assertIsNotNone(transport)
-            self.assertEqual(transport._params.audio_in_sample_rate, 16000)
-            self.assertEqual(transport._params.audio_out_sample_rate, 16000)
+        self.assertIn("run_pipeline_smallwebrtc", str(ctx.exception))
 
 
 class TestWhatsAppConfigurationDisplayAndMerge(IsolatedAsyncioTestCase):

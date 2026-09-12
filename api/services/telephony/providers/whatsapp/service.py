@@ -21,6 +21,7 @@ from api.constants import (
     TURN_PORT,
     TURN_SECRET,
 )
+from api.services.pipecat.call_gate import ANSWERED, TERMINATED, OutboundCallGate
 from api.services.turn import generate_turn_credentials
 from pipecat.transports.smallwebrtc.connection import IceServer, SmallWebRTCConnection
 from pipecat.transports.whatsapp.client import WhatsAppClient
@@ -34,7 +35,10 @@ WHATSAPP_CALL_KEY_PREFIX = "whatsapp:call:"
 # Active in-memory registry of ongoing WhatsApp WebRTC calls on this worker:
 # call_id -> (SmallWebRTCConnection, workflow_run_id, organization_id, phone_number_id)
 _active_connections: Dict[str, Tuple[SmallWebRTCConnection, int, int, str]] = {}
-_outbound_answered_events: Dict[str, asyncio.Event] = {}
+_outbound_answered_events: Dict[str, OutboundCallGate] = {}
+# call_id -> its pipeline task, so a rollback can cancel exactly the right one
+# instead of diffing the background-task set from outside this module.
+_pipeline_tasks: Dict[str, asyncio.Task] = {}
 _background_tasks: Set[asyncio.Task] = set()
 
 # Reusable aiohttp session and cached clients per phone_number_id
@@ -57,6 +61,18 @@ def set_pipeline_runner(runner: Callable[..., Any]) -> None:
 
 def get_pipeline_runner() -> Optional[Callable[..., Any]]:
     """Retrieve the registered voice pipeline runner callable."""
+    return _pipeline_runner
+
+
+def resolve_pipeline_runner() -> Optional[Callable[..., Any]]:
+    """Retrieve the pipeline runner wired at process startup.
+
+    Deliberately does no importing of its own. Reaching up into the routes
+    module from here to trigger its registration side effect made the service
+    layer depend on an HTTP module, and made whether an outbound call gets a
+    voice pipeline depend on import timing. Every process that can place a call
+    wires this explicitly instead - see ``install_whatsapp_pipeline_runner``.
+    """
     return _pipeline_runner
 
 
@@ -183,8 +199,8 @@ async def listen_for_remote_events() -> None:
 
                     if channel == REDIS_TERMINATE_CHANNEL:
                         answered_evt = _outbound_answered_events.pop(target_call_id, None)
-                        if answered_evt and not answered_evt.is_set():
-                            answered_evt.set()
+                        if answered_evt:
+                            answered_evt.resolve(TERMINATED)
                         entry = _active_connections.pop(target_call_id, None)
                         if entry:
                             conn = entry[0]
@@ -209,10 +225,28 @@ async def listen_for_remote_events() -> None:
                                         f"[WhatsApp] Applying cross-worker SDP answer for call {target_call_id}"
                                     )
                                     await conn.set_answer(sdp, type=sdp_type)
+                                    # Setting the remote description alone never starts
+                                    # the peer connection - the local handlers connect
+                                    # right after, and this path has to do the same.
+                                    if (
+                                        not getattr(conn, "_connect_invoked", False)
+                                        or conn.is_connected()
+                                    ):
+                                        await conn.connect()
                                 except Exception as e:
                                     logger.warning(
                                         f"[WhatsApp] Failed to set cross-worker answer: {e}"
                                     )
+                            if event_type == "accepted":
+                                # The webhook worker can only set this event when it
+                                # owns the connection, so the owning worker must
+                                # unblock its own waiting pipeline here.
+                                answered_evt = _outbound_answered_events.get(target_call_id)
+                                if answered_evt and not answered_evt.is_set():
+                                    logger.info(
+                                        f"[WhatsApp] Unblocking pipeline for cross-worker answered call {target_call_id}"
+                                    )
+                                    answered_evt.resolve(ANSWERED)
                 except Exception as parse_err:
                     logger.warning(f"[WhatsApp] Error handling cross-worker message: {parse_err}")
         except asyncio.CancelledError:
@@ -244,7 +278,16 @@ def register_outbound_active_connection(
     user_id: int,
 ) -> None:
     """Register an active outbound WebRTC connection and run its voice pipeline."""
-    answered_event = asyncio.Event()
+    runner = resolve_pipeline_runner()
+    if runner is None:
+        # Registering without a pipeline yields a connected but silent call that
+        # nothing ever answers; fail before the connection is tracked so the
+        # caller tears the call down instead.
+        raise RuntimeError(
+            f"No WhatsApp pipeline runner configured; refusing to register outbound call {call_id}"
+        )
+
+    answered_event = OutboundCallGate()
     _outbound_answered_events[call_id] = answered_event
 
     _active_connections[call_id] = (
@@ -255,24 +298,65 @@ def register_outbound_active_connection(
     )
     ensure_redis_subscriber()
 
-    if _pipeline_runner:
-        pipeline_task = asyncio.create_task(
-            _pipeline_runner(
-                connection=connection,
-                workflow_id=workflow_id,
-                workflow_run_id=workflow_run_id,
-                user_id=user_id,
-                organization_id=organization_id,
-                call_id=call_id,
-                call_answered_event=answered_event,
-            )
+    pipeline_task = asyncio.create_task(
+        runner(
+            connection=connection,
+            workflow_id=workflow_id,
+            workflow_run_id=workflow_run_id,
+            user_id=user_id,
+            organization_id=organization_id,
+            call_id=call_id,
+            call_answered_event=answered_event,
         )
-        _background_tasks.add(pipeline_task)
-        pipeline_task.add_done_callback(_background_tasks.discard)
-    else:
+    )
+    _background_tasks.add(pipeline_task)
+    _pipeline_tasks[call_id] = pipeline_task
+    pipeline_task.add_done_callback(_background_tasks.discard)
+    pipeline_task.add_done_callback(
+        lambda _t, cid=call_id: _pipeline_tasks.pop(cid, None)
+    )
+
+
+async def unregister_outbound_active_connection(
+    call_id: str, timeout: float = 5.0
+) -> None:
+    """Undo everything ``register_outbound_active_connection`` published.
+
+    Registration publishes three things at once - the active-connection entry,
+    the answer gate, and a running pipeline task - so a caller that tears down
+    only the peer connection leaves a dead call visible to cross-worker
+    terminate handling and status polling, with a pipeline still holding an
+    LLM/TTS session and a workflow run open for the life of the worker.
+
+    Owning the teardown here is what lets the task be looked up by ``call_id``
+    rather than inferred from outside this module. Safe to call when
+    registration never happened, or twice.
+    """
+    _active_connections.pop(call_id, None)
+
+    gate = _outbound_answered_events.pop(call_id, None)
+    if gate is not None:
+        # Release anything parked on the answer, with the truthful outcome.
+        gate.resolve(TERMINATED)
+
+    task = _pipeline_tasks.pop(call_id, None)
+    if task is None or task.done():
+        return
+
+    task.cancel()
+    try:
+        # Bounded: a pipeline that swallows cancellation must not hang the
+        # caller's request.
+        await asyncio.wait_for(asyncio.shield(task), timeout=timeout)
+    except asyncio.CancelledError:
+        pass
+    except asyncio.TimeoutError:
         logger.warning(
-            f"[WhatsApp] No pipeline runner configured; active connection {call_id} registered without pipeline task"
+            f"[WhatsApp] Pipeline task for {call_id} did not stop within {timeout}s "
+            "after cancellation; abandoning it."
         )
+    except Exception as e:
+        logger.warning(f"[WhatsApp] Pipeline task for {call_id} errored during teardown: {e}")
 
 
 # Aliases for backwards compatibility with existing private names

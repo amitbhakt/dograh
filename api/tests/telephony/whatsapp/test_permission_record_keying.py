@@ -9,9 +9,12 @@ from unittest import IsolatedAsyncioTestCase, TestCase
 from unittest.mock import AsyncMock, MagicMock
 
 from api.db.telephony_configuration_client import (
+    UNSET,
+    _apply_permission_updates,
     _canonical_recipient_number,
     _get_recipient_number_candidates,
     _select_permission_row,
+    _supplied_or_none,
 )
 
 EQUIVALENT_SPELLINGS = [
@@ -86,3 +89,81 @@ class TestSelectPermissionRow(IsolatedAsyncioTestCase):
 
         query.order_by.assert_called_once()
         session.execute.assert_awaited_once_with(query.order_by.return_value)
+
+
+class _Row:
+    """Stand-in for WhatsAppCallPermissionModel: same attributes, no ORM setup."""
+
+    def __init__(self, **kwargs):
+        for key, value in kwargs.items():
+            setattr(self, key, value)
+
+
+def _granted_row():
+    return _Row(
+        status="granted_temporary",
+        phone_number_id="old-phone-id",
+        permission_type="temporary",
+        meta_message_id="wamid.old",
+        expires_at="old-expiry",
+        granted_at="old-grant",
+        updated_at=None,
+    )
+
+
+class TestSuppliedOrNone(TestCase):
+    """UNSET is how a caller says "I didn't mention this field"."""
+
+    def test_unset_reads_as_none_for_a_new_row(self):
+        self.assertIsNone(_supplied_or_none(UNSET))
+
+    def test_explicit_none_is_not_confused_with_unset(self):
+        self.assertIsNone(_supplied_or_none(None))
+
+    def test_a_supplied_value_passes_through(self):
+        self.assertEqual(_supplied_or_none("granted_permanent"), "granted_permanent")
+
+
+class TestApplyPermissionUpdates(TestCase):
+    """A denial or revocation must be able to wipe a stale future expiry."""
+
+    def test_omitted_fields_keep_their_stored_value(self):
+        row = _granted_row()
+
+        _apply_permission_updates(row, status="denied", now="now")
+
+        self.assertEqual(row.status, "denied")
+        self.assertEqual(row.updated_at, "now")
+        self.assertEqual(row.phone_number_id, "old-phone-id")
+        self.assertEqual(row.permission_type, "temporary")
+        self.assertEqual(row.meta_message_id, "wamid.old")
+        self.assertEqual(row.expires_at, "old-expiry")
+        self.assertEqual(row.granted_at, "old-grant")
+
+    def test_explicit_none_clears_the_field_instead_of_being_ignored(self):
+        row = _granted_row()
+
+        _apply_permission_updates(
+            row,
+            status="denied",
+            now="now",
+            permission_type=None,
+            expires_at=None,
+            granted_at=None,
+        )
+
+        self.assertIsNone(row.permission_type)
+        self.assertIsNone(row.expires_at)
+        self.assertIsNone(row.granted_at)
+        # A field this call never mentioned is still left alone.
+        self.assertEqual(row.meta_message_id, "wamid.old")
+
+    def test_a_supplied_value_overwrites_the_stored_one(self):
+        row = _granted_row()
+
+        _apply_permission_updates(
+            row, status="granted_permanent", now="now", phone_number_id="new-phone-id"
+        )
+
+        self.assertEqual(row.phone_number_id, "new-phone-id")
+        self.assertEqual(row.status, "granted_permanent")

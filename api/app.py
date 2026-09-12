@@ -62,6 +62,15 @@ async def lifespan(app: FastAPI):
         # before any pipeline runs, without per-call DB lookups.
         await load_all_org_langfuse_credentials()
 
+        # Wire provider pipeline runners explicitly. Registration used to happen
+        # as an import side effect of the provider's routes module, which made
+        # it depend on whether something had imported those routes yet.
+        from api.services.telephony.providers.whatsapp.routes import (
+            install_whatsapp_pipeline_runner,
+        )
+
+        install_whatsapp_pipeline_runner()
+
         # Start cross-worker sync manager so config changes propagate to all workers
         sync_manager = WorkerSyncManager(REDIS_URL)
         sync_manager.register(

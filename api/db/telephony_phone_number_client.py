@@ -389,6 +389,13 @@ class TelephonyPhoneNumberClient(BaseDBClient):
             if is_active is not None:
                 row.is_active = is_active
             if is_default_caller_id is not None:
+                if is_default_caller_id:
+                    # Another number may already be the configuration's
+                    # default; clear it first so setting this one doesn't
+                    # violate uq_phone_numbers_default_caller.
+                    await self._clear_default_caller_id(
+                        session, telephony_configuration_id
+                    )
                 row.is_default_caller_id = is_default_caller_id
             if country_code is not None:
                 row.country_code = country_code

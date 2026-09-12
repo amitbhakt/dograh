@@ -24,18 +24,9 @@ from api.db.models import (
 from api.utils.telephony_address import normalize_telephony_address
 
 
-def _get_recipient_number_candidates(recipient_phone_number: str) -> list[str]:
-    raw = recipient_phone_number.strip()
-    digits = re.sub(r"\D", "", raw)
-    candidates = [raw, raw.lstrip("+")]
-    if digits:
-        candidates.extend([digits, f"+{digits}"])
-    try:
-        canonical = normalize_telephony_address(raw).canonical
-        candidates.extend([canonical, canonical.lstrip("+")])
-    except Exception:
-        pass
-    return list(dict.fromkeys([c for c in candidates if c]))
+# A recipient that carries no letters and no SIP punctuation is a dialable
+# number however its separators are spelled, so its digits alone identify it.
+_LETTERS_OR_SIP_RE = re.compile(r"[A-Za-z@:]")
 
 
 def _canonical_recipient_number(recipient_phone_number: str) -> str:
@@ -48,13 +39,47 @@ def _canonical_recipient_number(recipient_phone_number: str) -> str:
     "+447123456789", which then inserts a second row for the same recipient.
     This form is always in _get_recipient_number_candidates, so existing lookups
     keep finding it.
+
+    ``normalize_telephony_address`` only strips spaces, hyphens and parentheses
+    before deciding whether an input is a phone number; anything else (dots,
+    slashes, non-breaking spaces) leaves it classified as a SIP extension and
+    canonicalized to the raw string, which would key the row on its arrival
+    format after all. WhatsApp recipients are always PSTN numbers, so a
+    letter-free input is reduced to its digits first and only then handed to
+    the shared normalizer, which agrees with this form for every spelling it
+    does understand.
     """
     raw = recipient_phone_number.strip()
+    if not _LETTERS_OR_SIP_RE.search(raw):
+        digits = re.sub(r"\D", "", raw)
+        if digits:
+            return f"+{digits}"
     try:
         return normalize_telephony_address(raw).canonical
     except Exception:
         digits = re.sub(r"\D", "", raw)
         return f"+{digits}" if digits else raw
+
+
+def _get_recipient_number_candidates(recipient_phone_number: str) -> list[str]:
+    """Every stored spelling a lookup for this recipient must be able to reach.
+
+    The stored key itself leads the list: keying writes on one form only stops
+    duplicate rows if readers search for that same form, so the two helpers are
+    tied together here rather than left to agree by coincidence.
+    """
+    raw = recipient_phone_number.strip()
+    digits = re.sub(r"\D", "", raw)
+    canonical_key = _canonical_recipient_number(raw)
+    candidates = [canonical_key, canonical_key.lstrip("+"), raw, raw.lstrip("+")]
+    if digits:
+        candidates.extend([digits, f"+{digits}"])
+    try:
+        canonical = normalize_telephony_address(raw).canonical
+        candidates.extend([canonical, canonical.lstrip("+")])
+    except Exception:
+        pass
+    return list(dict.fromkeys([c for c in candidates if c]))
 
 
 async def _select_permission_row(session, query, recipient_phone_number: str):
@@ -75,6 +100,135 @@ async def _select_permission_row(session, query, recipient_phone_number: str):
             "recipient storage and should be merged."
         )
     return rows[0] if rows else None
+
+
+class _Unset:
+    """Marker for "the caller did not mention this field".
+
+    Nullable permission columns carry meaning when they are empty: a revoked
+    grant has no expiry and no grant time. ``None`` is therefore a value a
+    caller needs to be able to write, which it cannot be if ``None`` also means
+    "leave whatever is there". Fields default to this marker instead, so an
+    omitted argument keeps the stored value and an explicit ``None`` clears it.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid
+        return "UNSET"
+
+
+UNSET = _Unset()
+
+
+def _supplied_or_none(value):
+    """Read a maybe-omitted argument as the value a new row should start with."""
+    return None if isinstance(value, _Unset) else value
+
+
+def _apply_permission_updates(
+    row: WhatsAppCallPermissionModel,
+    *,
+    status: str,
+    now: datetime,
+    phone_number_id=UNSET,
+    permission_type=UNSET,
+    meta_message_id=UNSET,
+    expires_at=UNSET,
+    granted_at=UNSET,
+) -> None:
+    """Write the supplied fields onto an existing permission row.
+
+    Only fields the caller actually passed are touched, so a status-only
+    update leaves the rest alone, while a field passed as ``None`` is cleared
+    rather than silently retaining the previous grant's value.
+    """
+    row.status = status
+    if not isinstance(phone_number_id, _Unset):
+        row.phone_number_id = phone_number_id
+    if not isinstance(permission_type, _Unset):
+        row.permission_type = permission_type
+    if not isinstance(meta_message_id, _Unset):
+        row.meta_message_id = meta_message_id
+    if not isinstance(expires_at, _Unset):
+        row.expires_at = expires_at
+    if not isinstance(granted_at, _Unset):
+        row.granted_at = granted_at
+    row.updated_at = now
+
+
+async def _resolve_whatsapp_configs_by_phone_number_id(
+    session, phone_number_id: str
+) -> Dict[int, TelephonyConfigurationModel]:
+    """Every active WhatsApp configuration a Meta phone_number_id can refer to.
+
+    An id reaches us from two independent places that are not guaranteed to
+    name the same tenant: the id a customer typed into a configuration's
+    credentials, and the id recorded on a phone number attached to a
+    configuration (WABA-level setups, where the configured id is the business
+    account and Meta's webhooks carry one of the numbers underneath it). The
+    same business connected by two organizations lands in both. Searching one
+    source first and returning on a hit would silently pick a tenant, so both
+    are searched and merged; callers decide what to do when more than one
+    configuration comes back.
+    """
+    if not phone_number_id:
+        return {}
+
+    matches: Dict[int, TelephonyConfigurationModel] = {}
+
+    credentials_stmt = select(TelephonyConfigurationModel).where(
+        TelephonyConfigurationModel.provider == "whatsapp",
+        TelephonyConfigurationModel.credentials.op("->>")("phone_number_id")
+        == phone_number_id,
+        TelephonyConfigurationModel.inactive.is_(False),
+    )
+    result = await session.execute(credentials_stmt)
+    for row in result.scalars().all():
+        matches[row.id] = row
+
+    attached_stmt = (
+        select(TelephonyConfigurationModel)
+        .join(
+            TelephonyPhoneNumberModel,
+            TelephonyPhoneNumberModel.telephony_configuration_id
+            == TelephonyConfigurationModel.id,
+        )
+        .where(
+            TelephonyConfigurationModel.provider == "whatsapp",
+            TelephonyConfigurationModel.inactive.is_(False),
+            TelephonyPhoneNumberModel.is_active.is_(True),
+            (
+                TelephonyPhoneNumberModel.extra_metadata.op("->>")("phone_number_id")
+                == phone_number_id
+            )
+            | (
+                TelephonyPhoneNumberModel.extra_metadata.op("->>")(
+                    "meta_phone_number_id"
+                )
+                == phone_number_id
+            ),
+        )
+    )
+    result_attached = await session.execute(attached_stmt)
+    for row in result_attached.scalars().all():
+        matches[row.id] = row
+
+    return matches
+
+
+def _log_ambiguous_phone_number_id(
+    phone_number_id: str,
+    configs: Dict[int, TelephonyConfigurationModel],
+    action: str,
+) -> None:
+    ids = ", ".join(
+        f"{cfg_id} (org {cfg.organization_id})" for cfg_id, cfg in configs.items()
+    )
+    logger.error(
+        f"[WhatsApp] Ambiguous phone_number_id={phone_number_id!r}: matches "
+        f"{len(configs)} active configurations ({ids}). {action}"
+    )
 
 
 class TelephonyConfigurationInUseError(Exception):
@@ -248,70 +402,25 @@ class TelephonyConfigurationClient(BaseDBClient):
 
         Matches either the phone_number_id stored directly in configuration
         credentials or the phone_number_id stored in attached active phone
-        number extra_metadata (supporting WABA-level account setups).
+        number extra_metadata (supporting WABA-level account setups). Both
+        sources are evaluated: an id that resolves through one source on one
+        organization and through the other source on a different organization
+        is ambiguous, and answering with whichever source was consulted first
+        would route a call into an arbitrary tenant. An ambiguous id returns
+        None so the caller rejects the call instead.
         """
         async with self.async_session() as session:
-            # 1. Direct match on configuration credentials
-            stmt = select(TelephonyConfigurationModel).where(
-                TelephonyConfigurationModel.provider == "whatsapp",
-                TelephonyConfigurationModel.credentials.op("->>")(
-                    "phone_number_id"
-                )
-                == phone_number_id,
-                TelephonyConfigurationModel.inactive.is_(False),
+            configs = await _resolve_whatsapp_configs_by_phone_number_id(
+                session, phone_number_id
             )
-            result = await session.execute(stmt)
-            rows = result.scalars().all()
-            if len(rows) > 1:
-                ids = ", ".join(str(r.id) for r in rows)
-                logger.error(
-                    f"[WhatsApp] Ambiguous phone_number_id={phone_number_id!r}: "
-                    f"matches {len(rows)} active configurations ({ids}). "
-                    f"Rejecting inbound call to prevent wrong-tenant routing."
-                )
-                return None  # caller will reject the call
-            config = rows[0] if rows else None
-            if config:
-                return config
-
-            # 2. Match via attached phone number extra_metadata
-            stmt_phone = (
-                select(TelephonyConfigurationModel)
-                .join(
-                    TelephonyPhoneNumberModel,
-                    TelephonyPhoneNumberModel.telephony_configuration_id
-                    == TelephonyConfigurationModel.id,
-                )
-                .where(
-                    TelephonyConfigurationModel.provider == "whatsapp",
-                    TelephonyConfigurationModel.inactive.is_(False),
-                    TelephonyPhoneNumberModel.is_active.is_(True),
-                    (
-                        TelephonyPhoneNumberModel.extra_metadata.op("->>")(
-                            "phone_number_id"
-                        )
-                        == phone_number_id
-                    )
-                    | (
-                        TelephonyPhoneNumberModel.extra_metadata.op("->>")(
-                            "meta_phone_number_id"
-                        )
-                        == phone_number_id
-                    ),
-                )
+        if len(configs) > 1:
+            _log_ambiguous_phone_number_id(
+                phone_number_id,
+                configs,
+                "Rejecting the call to prevent wrong-tenant routing.",
             )
-            result_phone = await session.execute(stmt_phone)
-            rows_phone = result_phone.scalars().all()
-            unique_configs = {r.id: r for r in rows_phone}
-            if len(unique_configs) > 1:
-                ids = ", ".join(str(cid) for cid in unique_configs.keys())
-                logger.error(
-                    f"[WhatsApp] Ambiguous phone_number_id={phone_number_id!r} via extra_metadata: "
-                    f"matches {len(unique_configs)} active configurations ({ids}). "
-                    f"Rejecting inbound call."
-                )
-                return None
-            return next(iter(unique_configs.values())) if unique_configs else None
+            return None  # caller will reject the call
+        return next(iter(configs.values()), None)
 
     async def get_active_whatsapp_configurations(
         self,
@@ -513,16 +622,64 @@ class TelephonyConfigurationClient(BaseDBClient):
         self, phone_number_id: str, recipient_phone_number: str
     ) -> Optional[WhatsAppCallPermissionModel]:
         """Fetch WhatsApp call permission record by Meta phone_number_id and recipient number (with format tolerance)."""
-        candidates = _get_recipient_number_candidates(recipient_phone_number)
         async with self.async_session() as session:
-            return await _select_permission_row(
+            return await self._select_permission_row_for_phone_number_id(
                 session,
-                select(WhatsAppCallPermissionModel).where(
-                    WhatsAppCallPermissionModel.phone_number_id == phone_number_id,
-                    WhatsAppCallPermissionModel.recipient_phone_number.in_(candidates),
-                ),
+                phone_number_id,
                 recipient_phone_number,
+                ambiguity_action="Skipping the permission lookup.",
             )
+
+    @staticmethod
+    async def _select_permission_row_for_phone_number_id(
+        session,
+        phone_number_id: str,
+        recipient_phone_number: str,
+        ambiguity_action: str,
+    ) -> Optional[WhatsAppCallPermissionModel]:
+        """Find a recipient's permission row from a Meta phone_number_id.
+
+        Rows are written with the phone_number_id held in the configuration's
+        credentials, which for a WABA-level setup is the business account id,
+        while Meta's webhooks carry the id of the individual number underneath
+        it. Requiring the stored id to equal the incoming one therefore matches
+        nothing for exactly those configurations, and the update is dropped
+        without a trace. The id is resolved to its configuration first and the
+        row looked up by configuration and recipient, which is the pair the
+        unique constraint is built on; an unresolvable id falls back to the
+        literal match so nothing that worked before stops working.
+
+        Returns None for an id that resolves to more than one active
+        configuration rather than touching an arbitrary tenant's row.
+        """
+        candidates = _get_recipient_number_candidates(recipient_phone_number)
+        configs = await _resolve_whatsapp_configs_by_phone_number_id(
+            session, phone_number_id
+        )
+        if len(configs) > 1:
+            _log_ambiguous_phone_number_id(
+                phone_number_id, configs, ambiguity_action
+            )
+            return None
+
+        config = next(iter(configs.values()), None)
+        if config is not None:
+            key_clause = (
+                WhatsAppCallPermissionModel.telephony_configuration_id == config.id
+            )
+        else:
+            key_clause = (
+                WhatsAppCallPermissionModel.phone_number_id == phone_number_id
+            )
+
+        return await _select_permission_row(
+            session,
+            select(WhatsAppCallPermissionModel).where(
+                key_clause,
+                WhatsAppCallPermissionModel.recipient_phone_number.in_(candidates),
+            ),
+            recipient_phone_number,
+        )
 
     async def upsert_whatsapp_call_permission(
         self,
@@ -531,12 +688,22 @@ class TelephonyConfigurationClient(BaseDBClient):
         phone_number_id: str,
         recipient_phone_number: str,
         status: str,
-        permission_type: Optional[str] = None,
-        meta_message_id: Optional[str] = None,
-        expires_at: Optional[datetime] = None,
-        granted_at: Optional[datetime] = None,
+        permission_type: Optional[str] = UNSET,
+        meta_message_id: Optional[str] = UNSET,
+        expires_at: Optional[datetime] = UNSET,
+        granted_at: Optional[datetime] = UNSET,
     ) -> WhatsAppCallPermissionModel:
-        """Create or update a WhatsApp call permission record, handling concurrency races."""
+        """Create or update a WhatsApp call permission record, handling concurrency races.
+
+        ``permission_type``, ``meta_message_id``, ``expires_at`` and
+        ``granted_at`` distinguish "not supplied" from an explicit ``None``:
+        omitting one keeps the stored value, passing ``None`` clears it. When
+        Meta reports a denial or a revocation, or a grant that carries no
+        expiry, the caller passes ``None`` and means it — leaving the previous
+        grant's future ``expires_at`` in place would advertise a revoked
+        permission as usable to every reader that trusts the stored record
+        while Meta is unreachable.
+        """
         candidates = _get_recipient_number_candidates(recipient_phone_number)
         canonical_recipient = _canonical_recipient_number(recipient_phone_number)
         async with self.async_session() as session:
@@ -557,26 +724,25 @@ class TelephonyConfigurationClient(BaseDBClient):
                         phone_number_id=phone_number_id,
                         recipient_phone_number=canonical_recipient,
                         status=status,
-                        permission_type=permission_type,
-                        meta_message_id=meta_message_id,
+                        permission_type=_supplied_or_none(permission_type),
+                        meta_message_id=_supplied_or_none(meta_message_id),
                         requested_at=now,
-                        granted_at=granted_at,
-                        expires_at=expires_at,
+                        granted_at=_supplied_or_none(granted_at),
+                        expires_at=_supplied_or_none(expires_at),
                         updated_at=now,
                     )
                     session.add(row)
                 else:
-                    row.status = status
-                    row.phone_number_id = phone_number_id
-                    if permission_type is not None:
-                        row.permission_type = permission_type
-                    if meta_message_id is not None:
-                        row.meta_message_id = meta_message_id
-                    if expires_at is not None:
-                        row.expires_at = expires_at
-                    if granted_at is not None:
-                        row.granted_at = granted_at
-                    row.updated_at = now
+                    _apply_permission_updates(
+                        row,
+                        status=status,
+                        now=now,
+                        phone_number_id=phone_number_id,
+                        permission_type=permission_type,
+                        meta_message_id=meta_message_id,
+                        expires_at=expires_at,
+                        granted_at=granted_at,
+                    )
 
                 await session.commit()
                 await session.refresh(row)
@@ -597,18 +763,16 @@ class TelephonyConfigurationClient(BaseDBClient):
                     recipient_phone_number,
                 )
                 if row is not None:
-                    now = datetime.now(UTC)
-                    row.status = status
-                    row.phone_number_id = phone_number_id
-                    if permission_type is not None:
-                        row.permission_type = permission_type
-                    if meta_message_id is not None:
-                        row.meta_message_id = meta_message_id
-                    if expires_at is not None:
-                        row.expires_at = expires_at
-                    if granted_at is not None:
-                        row.granted_at = granted_at
-                    row.updated_at = now
+                    _apply_permission_updates(
+                        row,
+                        status=status,
+                        now=datetime.now(UTC),
+                        phone_number_id=phone_number_id,
+                        permission_type=permission_type,
+                        meta_message_id=meta_message_id,
+                        expires_at=expires_at,
+                        granted_at=granted_at,
+                    )
                     await session.commit()
                     await session.refresh(row)
                     return row
@@ -619,32 +783,36 @@ class TelephonyConfigurationClient(BaseDBClient):
         phone_number_id: str,
         recipient_phone_number: str,
         status: str,
-        permission_type: Optional[str] = None,
-        expires_at: Optional[datetime] = None,
-        granted_at: Optional[datetime] = None,
+        permission_type: Optional[str] = UNSET,
+        expires_at: Optional[datetime] = UNSET,
+        granted_at: Optional[datetime] = UNSET,
     ) -> Optional[WhatsAppCallPermissionModel]:
-        """Update permission status by Meta phone_number_id and recipient number (e.g. from webhooks)."""
-        candidates = _get_recipient_number_candidates(recipient_phone_number)
+        """Update permission status by Meta phone_number_id and recipient number (e.g. from webhooks).
+
+        The phone_number_id is resolved to its configuration before the row is
+        located, so a WABA-level configuration whose rows carry the business
+        account id still receives updates that arrive stamped with one of its
+        numbers. As in the upsert, an omitted optional field keeps its stored
+        value while an explicit ``None`` clears it.
+        """
         async with self.async_session() as session:
-            row = await _select_permission_row(
+            row = await self._select_permission_row_for_phone_number_id(
                 session,
-                select(WhatsAppCallPermissionModel).where(
-                    WhatsAppCallPermissionModel.phone_number_id == phone_number_id,
-                    WhatsAppCallPermissionModel.recipient_phone_number.in_(candidates),
-                ),
+                phone_number_id,
                 recipient_phone_number,
+                ambiguity_action="Skipping the permission update.",
             )
             if not row:
                 return None
 
-            row.status = status
-            if permission_type is not None:
-                row.permission_type = permission_type
-            if expires_at is not None:
-                row.expires_at = expires_at
-            if granted_at is not None:
-                row.granted_at = granted_at
-            row.updated_at = datetime.now(UTC)
+            _apply_permission_updates(
+                row,
+                status=status,
+                now=datetime.now(UTC),
+                permission_type=permission_type,
+                expires_at=expires_at,
+                granted_at=granted_at,
+            )
 
             await session.commit()
             await session.refresh(row)
@@ -654,11 +822,15 @@ class TelephonyConfigurationClient(BaseDBClient):
         self,
         meta_message_id: str,
         status: str,
-        permission_type: Optional[str] = None,
-        expires_at: Optional[datetime] = None,
-        granted_at: Optional[datetime] = None,
+        permission_type: Optional[str] = UNSET,
+        expires_at: Optional[datetime] = UNSET,
+        granted_at: Optional[datetime] = UNSET,
     ) -> Optional[WhatsAppCallPermissionModel]:
-        """Update permission status by Meta message ID (e.g. from messages status or reply webhook)."""
+        """Update permission status by Meta message ID (e.g. from messages status or reply webhook).
+
+        An omitted optional field keeps its stored value; an explicit ``None``
+        clears it, so a decline reply drops the previous grant's expiry.
+        """
         async with self.async_session() as session:
             result = await session.execute(
                 select(WhatsAppCallPermissionModel).where(
@@ -669,14 +841,14 @@ class TelephonyConfigurationClient(BaseDBClient):
             if not row:
                 return None
 
-            row.status = status
-            if permission_type is not None:
-                row.permission_type = permission_type
-            if expires_at is not None:
-                row.expires_at = expires_at
-            if granted_at is not None:
-                row.granted_at = granted_at
-            row.updated_at = datetime.now(UTC)
+            _apply_permission_updates(
+                row,
+                status=status,
+                now=datetime.now(UTC),
+                permission_type=permission_type,
+                expires_at=expires_at,
+                granted_at=granted_at,
+            )
             await session.commit()
             await session.refresh(row)
             return row

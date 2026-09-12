@@ -14,6 +14,7 @@ Key Features:
 - Permission Management: Temporary and permanent call permissions
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -29,6 +30,7 @@ from api.enums import TelephonyCallStatus, WorkflowRunMode
 from api.services.telephony import ws_auth
 from api.services.telephony.providers.whatsapp.config import (
     DEFAULT_WHATSAPP_PERMISSION_MESSAGE,
+    normalize_whatsapp_permission_status,
     parse_whatsapp_expiration,
 )
 
@@ -215,6 +217,7 @@ class WhatsAppProvider(TelephonyProvider):
             get_or_create_whatsapp_client as _get_or_create_whatsapp_client,
             get_whatsapp_redis as _get_redis,
             register_outbound_active_connection,
+            unregister_outbound_active_connection,
         )
 
         from api.utils.telephony_address import normalize_telephony_address
@@ -335,18 +338,22 @@ class WhatsAppProvider(TelephonyProvider):
                             f"[WhatsApp] Failed saving granted permission to local DB: {db_err}"
                         )
                 else:
-                    # Permission is revoked or not granted in Meta
-                    if org_id and telephony_config_id and meta_status:
-                        normalized_status = meta_status
-                        if meta_status in ("permanent", "granted_permanent"):
-                            normalized_status = "granted_permanent"
-                        elif meta_status in ("temporary", "granted", "granted_temporary"):
-                            normalized_status = "granted_temporary"
-                        elif meta_status in ("no_permission",):
-                            normalized_status = "denied"
-                        elif meta_status in ("denied", "revoked", "expired"):
-                            normalized_status = meta_status
-
+                    # Meta answered and the recipient cannot be called. Store the
+                    # state through the shared alias map rather than a local
+                    # transcription of it: "no_permission" (never granted) has to
+                    # stay distinct from "denied" (explicitly refused), because
+                    # the parked-run sweep fails campaign runs outright on
+                    # "denied". An unrecognised or future status normalizes to
+                    # None and is skipped - overwriting a good record with a
+                    # value nothing downstream understands is worse than leaving
+                    # the record as it was.
+                    normalized_status = normalize_whatsapp_permission_status(meta_status)
+                    if meta_status and normalized_status is None:
+                        logger.warning(
+                            f"[WhatsApp] Unrecognised permission status '{meta_status}' reported by Meta "
+                            f"for {to_number}; leaving the stored permission record untouched."
+                        )
+                    if org_id and telephony_config_id and normalized_status:
                         await db_client.upsert_whatsapp_call_permission(
                             organization_id=org_id,
                             telephony_configuration_id=telephony_config_id,
@@ -399,8 +406,29 @@ class WhatsAppProvider(TelephonyProvider):
                 detail=f"Failed to initiate WhatsApp call: {str(e)}",
             )
 
-        # 4. Register active WebRTC connection on this worker
+        # 4. Register active WebRTC connection on this worker.
+        #
+        # Redis state is written first because it is the step that actually
+        # talks to the network and can fail. Registration after it is
+        # synchronous, so the common failure leaves nothing half-registered,
+        # and the pipeline only starts once the cross-worker lookup key exists.
+        redis_key = f"{WHATSAPP_CALL_KEY_PREFIX}{call_id}"
+        redis = None
+        redis_key_written = False
         try:
+            redis = await _get_redis()
+            if redis:
+                await redis.setex(
+                    redis_key,
+                    3600,
+                    json.dumps({
+                        "workflow_run_id": workflow_run_id,
+                        "organization_id": org_id,
+                        "phone_number_id": self.phone_number_id,
+                    }),
+                )
+                redis_key_written = True
+
             register_outbound_active_connection(
                 call_id=call_id,
                 connection=connection,
@@ -410,22 +438,19 @@ class WhatsAppProvider(TelephonyProvider):
                 workflow_id=workflow_id,
                 user_id=user_id,
             )
-
-            redis = await _get_redis()
-            if redis:
-                await redis.setex(
-                    f"{WHATSAPP_CALL_KEY_PREFIX}{call_id}",
-                    3600,
-                    json.dumps({
-                        "workflow_run_id": workflow_run_id,
-                        "organization_id": org_id,
-                        "phone_number_id": self.phone_number_id,
-                    }),
-                )
         except Exception as reg_err:
             logger.error(
                 f"[WhatsApp] Failed to register outbound connection for call {call_id}: {reg_err}"
             )
+            try:
+                # The service layer owns this state, so it owns the teardown:
+                # registry entries, the answer gate, and the pipeline task all
+                # come down together, keyed by call_id.
+                await unregister_outbound_active_connection(call_id)
+            except Exception as unregister_err:
+                logger.warning(
+                    f"[WhatsApp] Error unregistering rolled-back call {call_id}: {unregister_err}"
+                )
             try:
                 if hasattr(connection, "disconnect"):
                     await connection.disconnect()
@@ -437,6 +462,11 @@ class WhatsAppProvider(TelephonyProvider):
                 await client.terminate_call(call_id)
             except Exception:
                 pass
+            if redis_key_written and redis:
+                try:
+                    await redis.delete(redis_key)
+                except Exception:
+                    pass
             raise HTTPException(
                 status_code=500,
                 detail=f"Failed to register active call connection: {reg_err}",
@@ -457,6 +487,20 @@ class WhatsAppProvider(TelephonyProvider):
                 "destination": to_number,
             },
             raw_response=resp,
+        )
+
+    async def end_call(
+        self, call_id: str, workflow_run_id: int, organization_id: int
+    ) -> bool:
+        """Terminate a live WhatsApp call at Meta and tear down local state."""
+        # Imported at call time: routes.py imports this package at module scope,
+        # so a top-level import here would close the cycle.
+        from api.services.telephony.providers.whatsapp.routes import (
+            terminate_whatsapp_call_by_id,
+        )
+
+        return await terminate_whatsapp_call_by_id(
+            call_id, workflow_run_id, organization_id
         )
 
     async def send_call_permission_request(

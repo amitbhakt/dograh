@@ -1,10 +1,15 @@
 """Tests for matching a WhatsApp recipient number against parked campaign leads.
 
-The SQL prefilter in get_queued_runs_awaiting_whatsapp_permission is deliberately
-wide (it ILIKEs digit runs against the serialized context_variables) so that
-punctuated numbers still get loaded. is_same_recipient_number is what decides
-which of those rows actually belong to the recipient, so the false-positive
-boundary lives here.
+is_same_recipient_number is a *consent* gate: a match lets a permission
+webhook activate or fail a parked campaign run. Campaign leads are guaranteed
+to be stored as international numbers (CampaignSourceSyncService
+.validate_source_data, api/services/campaign/source_sync.py, rejects any CSV
+row whose phone_number does not start with "+"), and WhatsApp webhook
+recipients arrive as a Meta ``wa_id``, which is always a full international
+number too. Because both sides are guaranteed a country code, the matcher
+requires canonical digit equality and deliberately does NOT infer a missing
+one - a number missing its country code is a different, unverifiable
+subscriber, not a formatting variant of one.
 """
 
 import re
@@ -30,33 +35,47 @@ def _matches(candidate: str, target: str) -> bool:
 
 class TestIsSameRecipientNumber(TestCase):
     def test_matches_formatting_variants(self):
-        for candidate in ("+1 (555) 123-4567", "1-555-123-4567", "15551234567", "+15551234567"):
+        for candidate in (
+            "+1 (555) 123-4567",
+            "1-555-123-4567",
+            "15551234567",
+            "+15551234567",
+        ):
             with self.subTest(candidate=candidate):
                 self.assertTrue(_matches(candidate, "+15551234567"))
 
-    def test_matches_across_missing_country_code(self):
-        self.assertTrue(_matches("5551234567", "+15551234567"))
-        self.assertTrue(_matches("+919876543210", "9876543210"))
+    def test_matches_exact_equal_numbers(self):
+        self.assertTrue(_matches("+919876543210", "+919876543210"))
+        self.assertTrue(_matches("+33 6 12 34 56 78", "+33612345678"))
+
+    def test_rejects_missing_country_code(self):
+        """Deliberate change vs. the old suffix heuristic.
+
+        A lead stored without its country code no longer reactivates against
+        a webhook number that carries one (and vice versa): "+441234567890"
+        and "+1234567890" may be unrelated subscribers, and a permission
+        grant/denial from one must never move the other's run. Both sides are
+        guaranteed a country code at ingest/webhook time (see the module
+        docstring), so this should not arise for data that went through the
+        normal CSV ingest path. If a legacy or malformed row without a country
+        code ever needs to reactivate, the fix is to normalize it at ingest
+        with a country hint (a campaign- or lead-level country field, via
+        normalize_telephony_address(raw, country_hint=...) in
+        api/utils/telephony_address.py) - not to relax this matcher.
+        """
+        self.assertFalse(_matches("5551234567", "+15551234567"))
+        self.assertFalse(_matches("+919876543210", "9876543210"))
+        self.assertFalse(_matches("+441234567890", "+1234567890"))
 
     def test_rejects_different_subscriber(self):
         self.assertFalse(_matches("+15559994567", "+15551234567"))
 
     def test_rejects_unrelated_number_sharing_a_long_suffix(self):
-        """A shared tail longer than any country code is coincidence, not the same lead."""
-        self.assertFalse(_matches("+442079461234567", "1234567"))
-        self.assertFalse(_matches("+8613800001234567", "5551234567"))
-
-    def test_rejects_local_fragment_shorter_than_a_real_number(self):
-        """A 7-digit local number has no area code, so any longer number ends the same way."""
-        # 415-123-4567 and 555-123-4567 share their last 7 digits but are
-        # different subscribers; neither may match the bare local part.
-        self.assertFalse(_matches("4151234567", "1234567"))
-        self.assertFalse(_matches("1234567", "5551234567"))
-
-    def test_rejects_trunk_prefix_masquerading_as_country_code(self):
-        """A leading 0 is a national trunk prefix; no country dials with one."""
-        self.assertFalse(_matches("012345678", "12345678"))
+        """A shared tail is coincidence, not the same lead, once both sides
+        are full international numbers."""
+        self.assertFalse(_matches("+442079461234567", "+15551234567"))
+        self.assertFalse(_matches("+8613800001234567", "+15551234567"))
 
     def test_rejects_short_and_empty_candidates(self):
         self.assertFalse(_matches("", "+15551234567"))
-        self.assertFalse(_matches("123456", "0123456"))
+        self.assertFalse(_matches("123456", "+15551234567"))

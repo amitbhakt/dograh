@@ -94,6 +94,11 @@ export default function TelephonyConfigurationDetailPage() {
       ? config.credentials.stasis_app_name
       : "";
   const stasisDialplanLine = `same => n,Stasis(${stasisAppName})`;
+  // Masked by the API (registry marks it sensitive), so this is a placeholder
+  // for "a token is configured" — never the token itself.
+  const webhookVerifyTokenMask = String(
+    (config?.credentials as Record<string, unknown>)?.webhook_verify_token ?? "",
+  );
   const [phoneNumbers, setPhoneNumbers] = useState<PhoneNumberResponse[]>([]);
   const [loading, setLoading] = useState(true);
   const [editConfigOpen, setEditConfigOpen] = useState(false);
@@ -420,27 +425,48 @@ export default function TelephonyConfigurationDetailPage() {
           {isWhatsApp && (
             <div className="space-y-1 min-w-0 max-w-full">
               <p className="text-xs text-muted-foreground">Webhook verify token</p>
-              <button
-                type="button"
-                onClick={() => {
-                  const token = String(
-                    (config?.credentials as Record<string, any>)?.webhook_verify_token || "",
-                  );
-                  copyTextToClipboard(token)
-                    .then(() => toast.success("Webhook verify token copied"))
-                    .catch(() => toast.error("Failed to copy token"));
-                }}
-                title="Click to copy webhook verify token"
-                aria-label="Copy webhook verify token"
-                className="inline-flex items-center gap-1.5 self-start rounded font-mono text-xs text-muted-foreground hover:text-foreground max-w-full min-w-0"
-              >
-                <span className="truncate min-w-0">
-                  {String(
-                    (config?.credentials as Record<string, any>)?.webhook_verify_token || "-",
-                  )}
-                </span>
-                <Copy className="h-3.5 w-3.5 shrink-0" />
-              </button>
+              {/* Deliberately not copyable. The configuration endpoint masks
+                  every field the provider registry marks sensitive, and the
+                  verify token is one of them — so what is rendered here is
+                  `****…abcd`, not the secret. Offering a copy action handed the
+                  user the mask, which Meta then rejects on Verify and Save with
+                  no hint as to why. Show the state instead, and route anyone
+                  who no longer has the real value to rotating it. */}
+              {webhookVerifyTokenMask ? (
+                <>
+                  <p
+                    className="font-mono text-xs text-muted-foreground truncate min-w-0"
+                    title="Masked — the stored token is never sent to the browser"
+                  >
+                    {webhookVerifyTokenMask}
+                  </p>
+                  <p className="text-xs text-muted-foreground mt-1">
+                    Masked for security — only the last characters are shown, so this
+                    is not the value to paste into Meta. Use the token you set when
+                    you saved this configuration. Lost it?{" "}
+                    <button
+                      type="button"
+                      onClick={() => setEditConfigOpen(true)}
+                      className="underline hover:text-foreground"
+                    >
+                      Set a new token
+                    </button>{" "}
+                    and use that in Meta instead.
+                  </p>
+                </>
+              ) : (
+                <p className="text-xs text-muted-foreground">
+                  Not set.{" "}
+                  <button
+                    type="button"
+                    onClick={() => setEditConfigOpen(true)}
+                    className="underline hover:text-foreground"
+                  >
+                    Add a verify token
+                  </button>{" "}
+                  before configuring the webhook in Meta.
+                </p>
+              )}
               <p className="text-xs text-muted-foreground mt-1">
                 In Meta App Dashboard (<strong>WhatsApp &gt; Configuration &gt; Edit</strong>): paste the Callback URL and Verify Token, then click <strong>Verify and Save</strong> and subscribe to the <code>calls</code> field.
               </p>

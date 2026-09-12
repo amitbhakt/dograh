@@ -33,6 +33,10 @@ from pipecat.pipeline.worker import PipelineWorker
 from pipecat.processors.audio.audio_buffer_processor import AudioBufferProcessor
 from pipecat.utils.enums import EndTaskReason
 
+from api.services.pipecat.call_gate import ANSWERED, OutboundCallGate
+
+
+
 
 async def _capture_call_event(
     workflow_run_id: int,
@@ -80,7 +84,7 @@ def register_event_handlers(
     user_provider_id: str | None = None,
     integration_runtime_sessions: list[IntegrationRuntimeSession] | None = None,
     include_transcript_end_timestamps: bool = False,
-    call_answered_event: asyncio.Event | None = None,
+    call_answered_event: "OutboundCallGate | None" = None,
 ):
     """Register all event handlers for transport and task events.
 
@@ -182,7 +186,16 @@ def register_event_handlers(
             logger.info(
                 f"[run_id={workflow_run_id}] WebRTC connected but awaiting remote call answer before starting speech..."
             )
-            await call_answered_event.wait()
+            # The gate reports why it opened, so there is nothing to race and
+            # nothing to wait out: a call that died before it was answered
+            # releases this with TERMINATED, and an answered one with ANSWERED.
+            outcome = await call_answered_event.wait()
+            if outcome != ANSWERED:
+                logger.info(
+                    f"[run_id={workflow_run_id}] Call ended before it was answered "
+                    f"(outcome={outcome}); not recording or greeting."
+                )
+                return
             logger.info(
                 f"[run_id={workflow_run_id}] Remote call answer confirmed, starting speech and audio recording."
             )

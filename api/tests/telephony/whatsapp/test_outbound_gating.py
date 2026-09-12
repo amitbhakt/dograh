@@ -255,7 +255,7 @@ class TestWhatsAppLivePermissions(IsolatedAsyncioTestCase):
 
         with patch.object(db_client, "get_telephony_configuration_for_org", AsyncMock(return_value=mock_config)), \
              patch.object(db_client, "get_whatsapp_call_permission", AsyncMock(return_value=None)), \
-             patch.object(db_client, "update_whatsapp_call_permission_status_by_wa_id", AsyncMock()) as mock_update_db, \
+             patch.object(db_client, "upsert_whatsapp_call_permission", AsyncMock()) as mock_upsert_db, \
              patch("api.services.telephony.providers.whatsapp.routes._get_or_create_whatsapp_client", return_value=mock_client):
 
             res = await check_whatsapp_permission(
@@ -266,7 +266,13 @@ class TestWhatsAppLivePermissions(IsolatedAsyncioTestCase):
 
             self.assertFalse(res.can_call)
             self.assertEqual(res.status, "no_permission")
-            mock_update_db.assert_awaited_once_with(
+            # The no-permission branch of check_whatsapp_permission persists via
+            # upsert_whatsapp_call_permission (not update_..._status_by_wa_id),
+            # and stores "no_permission" as-is: only an explicit "denied" or
+            # "revoked" may hard-fail this recipient's parked campaign runs.
+            mock_upsert_db.assert_awaited_once_with(
+                organization_id=1,
+                telephony_configuration_id=10,
                 phone_number_id="test_phone_id",
                 recipient_phone_number="+447123456789",
                 status="no_permission",
@@ -294,10 +300,14 @@ class TestWhatsAppLivePermissions(IsolatedAsyncioTestCase):
             }
         )
 
-        with patch("api.services.telephony.providers.whatsapp.routes._get_or_create_whatsapp_client", return_value=mock_client), \
+        # provider.initiate_call imports the client factory from .service at call
+        # time, so the service module - not .routes - is the binding a patch has
+        # to replace. The no-permission branch persists via
+        # db_client.upsert_whatsapp_call_permission, so that must be stubbed too.
+        with patch("api.services.telephony.providers.whatsapp.service.get_or_create_whatsapp_client", return_value=mock_client), \
              patch.object(db_client, "get_whatsapp_call_permission", AsyncMock(return_value=None)), \
              patch.object(db_client, "get_whatsapp_call_permission_by_phone_id", AsyncMock(return_value=None)), \
-             patch.object(db_client, "update_whatsapp_call_permission_status_by_wa_id", AsyncMock()):
+             patch.object(db_client, "upsert_whatsapp_call_permission", AsyncMock()):
 
             with self.assertRaises(HTTPException) as ctx:
                 await provider.initiate_call(

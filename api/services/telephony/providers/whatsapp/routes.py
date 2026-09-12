@@ -64,6 +64,7 @@ from api.services.telephony.providers.whatsapp.restrictions import (
     is_restricted_country,
     validate_destination_country,
 )
+from api.services.pipecat.call_gate import ANSWERED, TERMINATED, OutboundCallGate
 from api.services.workflow.run_creation import prepare_workflow_run_inputs
 from api.services.workflow_run_failure import mark_workflow_run_failed
 from api.utils.telephony_address import normalize_telephony_address
@@ -92,6 +93,7 @@ from api.services.telephony.providers.whatsapp.service import (
     _http_session,
     _listen_for_remote_events,
     _outbound_answered_events,
+    unregister_outbound_active_connection,
     _redis_client,
     _redis_subscriber_task,
     build_whatsapp_ice_servers,
@@ -103,6 +105,29 @@ from api.services.telephony.providers.whatsapp.service import (
     register_outbound_active_connection,
     set_pipeline_runner,
 )
+
+
+class WhatsAppPermissionCheckResponse(BaseModel):
+    """Response payload for GET /whatsapp/permissions/check."""
+
+    can_call: bool
+    status: str
+    permission_type: Optional[str] = None
+    expires_at: Optional[str] = None
+    hours_remaining: Optional[float] = None
+    restricted_country: bool = False
+    restriction_reason: Optional[str] = None
+    delivery_error: Optional[str] = None
+    can_request_permission: bool = True
+    request_limit_reason: Optional[str] = None
+
+
+class WhatsAppPermissionRequestPayload(BaseModel):
+    """Request payload for POST /whatsapp/permissions/request."""
+
+    telephony_configuration_id: int
+    recipient_phone_number: str
+    body_text: Optional[str] = None
 
 
 async def _reject_whatsapp_call(
@@ -830,7 +855,7 @@ async def _run_whatsapp_pipeline(
     user_id: int,
     organization_id: int,
     call_id: str,
-    call_answered_event: Optional[asyncio.Event] = None,
+    call_answered_event: Optional["OutboundCallGate"] = None,
 ) -> None:
     """Execute Dograh's WebRTC AI pipeline over the active peer connection."""
     try:
@@ -863,8 +888,8 @@ async def _run_whatsapp_pipeline(
             )
     finally:
         answered_evt = _outbound_answered_events.pop(call_id, None)
-        if answered_evt and not answered_evt.is_set():
-            answered_evt.set()
+        if answered_evt:
+            answered_evt.resolve(TERMINATED)
         try:
             await terminate_whatsapp_call_by_id(
                 call_id=call_id,
@@ -891,9 +916,23 @@ async def _run_whatsapp_pipeline(
 
 
 async def _handle_call_terminate(
-    call_data: Dict[str, Any], payload: Dict[str, Any]
+    call_data: Dict[str, Any],
+    payload: Dict[str, Any],
+    *,
+    provider_termination_unconfirmed: bool = False,
 ) -> None:
-    """Handle a WhatsApp call termination event from Meta."""
+    """Handle a WhatsApp call termination event from Meta.
+
+    ``provider_termination_unconfirmed`` marks the case where we are tearing
+    down without Meta having acknowledged the hangup. Resources we own (peer
+    connection, pipeline, concurrency slot) still come down - leaving a pipeline
+    running against a call nobody is watching is strictly worse - but the Redis
+    recovery key is left in place so the call can still be identified and the
+    hangup re-issued. The durable stamp on the run is written by
+    ``terminate_whatsapp_call_by_id``, not here: this block only executes on the
+    worker that owns the connection, so a cross-worker terminate would otherwise
+    lose it.
+    """
     call_id = call_data.get("id") or ""
     if not call_id:
         return
@@ -903,7 +942,8 @@ async def _handle_call_terminate(
     try:
         redis = await _get_redis()
         if redis:
-            await redis.delete(f"{WHATSAPP_CALL_KEY_PREFIX}{call_id}")
+            if not provider_termination_unconfirmed:
+                await redis.delete(f"{WHATSAPP_CALL_KEY_PREFIX}{call_id}")
             await redis.publish(
                 REDIS_TERMINATE_CHANNEL,
                 json.dumps({"call_id": call_id}),
@@ -912,8 +952,8 @@ async def _handle_call_terminate(
         logger.warning(f"[WhatsApp] Failed to publish terminate to Redis: {e}")
 
     answered_evt = _outbound_answered_events.pop(call_id, None)
-    if answered_evt and not answered_evt.is_set():
-        answered_evt.set()
+    if answered_evt:
+        answered_evt.resolve(TERMINATED)
 
     entry = _active_connections.pop(call_id, None)
     if entry:
@@ -1048,7 +1088,7 @@ async def _handle_call_accepted(
     answered_evt = _outbound_answered_events.get(call_id)
     if answered_evt and not answered_evt.is_set():
         logger.info(f"[WhatsApp] Unblocking pipeline for answered call {call_id}")
-        answered_evt.set()
+        answered_evt.resolve(ANSWERED)
 
     # Update DB state and active connection to running and in-progress
     if call_id in _active_connections:
@@ -1091,7 +1131,19 @@ async def _handle_call_accepted(
 
 
 # Register the WhatsApp pipeline runner with the service layer
-set_pipeline_runner(_run_whatsapp_pipeline)
+def install_whatsapp_pipeline_runner() -> None:
+    """Wire the WhatsApp voice pipeline runner into the service layer.
+
+    Called from each composition root that can place or receive a WhatsApp call
+    (the FastAPI app and the ARQ worker). The module-level call below keeps any
+    process that mounts these routes working; the explicit function is what lets
+    a worker that never touches HTTP wire it deterministically, instead of the
+    service layer importing this module mid-call to trigger a side effect.
+    """
+    set_pipeline_runner(_run_whatsapp_pipeline)
+
+
+install_whatsapp_pipeline_runner()
 
 
 def get_active_whatsapp_connection_by_call_id(
@@ -1118,8 +1170,8 @@ async def terminate_whatsapp_call_by_id(
 ) -> bool:
     """Terminate an active WhatsApp call locally and via Meta Graph API."""
     answered_evt = _outbound_answered_events.pop(call_id, None)
-    if answered_evt and not answered_evt.is_set():
-        answered_evt.set()
+    if answered_evt:
+        answered_evt.resolve(TERMINATED)
 
     phone_number_id = None
     entry = _active_connections.get(call_id)
@@ -1152,7 +1204,11 @@ async def terminate_whatsapp_call_by_id(
         except Exception:
             pass
 
-    # 1. Ask Meta Graph API to terminate the call on user device
+    # 1. Ask Meta Graph API to terminate the call on user device.
+    # Tracked separately from the local teardown below: if Meta never confirms,
+    # the recipient's leg may still be up, and the caller must not be told the
+    # hang-up succeeded.
+    provider_terminated = False
     try:
         config = None
         if phone_number_id:
@@ -1160,7 +1216,12 @@ async def terminate_whatsapp_call_by_id(
                 str(phone_number_id)
             )
         if not config and organization_id:
-            configs = await db_client.list_active_telephony_configurations_by_provider(
+            # Org-scoped: list_active_telephony_configurations_by_provider is
+            # cross-org and takes only `provider`, so the previous call both
+            # raised TypeError (swallowed by the except below, which is why this
+            # fallback never once worked) and would have reached another
+            # tenant's credentials if it had.
+            configs = await db_client.list_telephony_configurations_by_provider(
                 organization_id, "whatsapp"
             )
             config = configs[0] if configs else None
@@ -1176,8 +1237,13 @@ async def terminate_whatsapp_call_by_id(
                 )
                 if client and client._whatsapp_api:
                     resp = await client._whatsapp_api.terminate_call_to_whatsapp(call_id)
+                    provider_terminated = True
                     logger.info(
                         f"[WhatsApp] Sent terminate request to Meta API for call {call_id}: resp={resp}"
+                    )
+                else:
+                    logger.warning(
+                        f"[WhatsApp] Cannot terminate call {call_id} at Meta: no API client"
                     )
             else:
                 logger.warning(
@@ -1190,9 +1256,44 @@ async def terminate_whatsapp_call_by_id(
     except Exception as e:
         logger.warning(f"[WhatsApp] Meta Graph API termination failed: {e}")
 
-    # 2. Terminate connection and clean up workflow run locally
-    await _handle_call_terminate({"id": call_id}, {})
-    return True
+    # 2. Tear down locally. This runs even when Meta did not confirm: dropping
+    # our peer usually ends the call anyway, and leaving a pipeline and a
+    # concurrency slot held for a call nobody can observe is worse. What we do
+    # NOT do in that case is discard the call's identity - see
+    # provider_termination_unconfirmed, which keeps the Redis recovery key and
+    # stamps the run so the hangup can be re-issued against the same call.
+    await _handle_call_terminate(
+        {"id": call_id},
+        {},
+        provider_termination_unconfirmed=not provider_terminated,
+    )
+
+    if not provider_terminated:
+        logger.error(
+            f"[WhatsApp] Local teardown for call {call_id} completed, but Meta never "
+            "confirmed termination; the recipient's leg may still be connected."
+        )
+
+    # Stamp the run here rather than inside the teardown: this runs on whichever
+    # worker handled the request, owning the connection or not, so the durable
+    # record of an unconfirmed hangup survives a cross-worker terminate. Also
+    # clears the stamp when a retry finally succeeds - that retry has no active
+    # connection left, so the teardown's run update is skipped entirely.
+    if workflow_run_id:
+        try:
+            run = await db_client.get_workflow_run(workflow_run_id)
+            ctx = dict(run.gathered_context or {}) if run else {}
+            if ctx.get("provider_termination_unconfirmed") != (not provider_terminated):
+                ctx["provider_termination_unconfirmed"] = not provider_terminated
+                await db_client.update_workflow_run(
+                    workflow_run_id, gathered_context=ctx
+                )
+        except Exception as e:
+            logger.warning(
+                f"[WhatsApp] Failed recording termination-confirmation state for "
+                f"run {workflow_run_id}: {e}"
+            )
+    return provider_terminated
 
 
 async def _handle_user_call_permissions_change(
@@ -1674,9 +1775,12 @@ async def check_whatsapp_permission(
                     can_request_permission=False,
                 )
             else:
-                # Meta explicitly says no permission or revoked
-                if meta_status in ("no_permission", "revoked", "denied", "expired"):
-                    normalized_st = "denied" if meta_status == "no_permission" else meta_status
+                # Meta explicitly says no permission or revoked.
+                # "no_permission" means the recipient has not answered the prompt
+                # yet and must stay distinct from "denied": campaign reactivation
+                # hard-fails parked runs on "denied".
+                normalized_st = normalize_whatsapp_permission_status(meta_status)
+                if normalized_st in ("no_permission", "revoked", "denied", "expired"):
                     await db_client.upsert_whatsapp_call_permission(
                         organization_id=config.organization_id,
                         telephony_configuration_id=config.id,
@@ -1685,10 +1789,10 @@ async def check_whatsapp_permission(
                         status=normalized_st,
                         expires_at=None,
                     )
-                    if meta_status in ("revoked", "denied"):
+                    if normalized_st in ("revoked", "denied"):
                         await reactivate_campaign_runs_for_recipient(
                             recipient,
-                            meta_status,
+                            normalized_st,
                             phone_number_id=phone_number_id,
                             telephony_configuration_id=config.id,
                         )

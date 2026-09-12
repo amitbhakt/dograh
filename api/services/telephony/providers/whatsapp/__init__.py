@@ -180,6 +180,14 @@ SPEC = ProviderSpec(
     name="whatsapp",
     provider_cls=WhatsAppProvider,
     config_loader=_config_loader,
+    # Both fields are required by ProviderSpec but inert for WhatsApp: media is
+    # WebRTC, so calls run through run_pipeline_smallwebrtc rather than
+    # run_pipeline_telephony, which is the only caller of transport_factory and
+    # the only consumer of transport_sample_rate. 16000 matches what the live
+    # SmallWebRTC path actually uses (create_audio_config caps the pipeline at
+    # 16 kHz for VAD; aiortc resamples Meta's 48 kHz Opus down to it in
+    # SmallWebRTCTransport). See transport.py for the full trace -- the factory
+    # raises rather than building a transport Meta will never speak to.
     transport_factory=create_transport,
     transport_sample_rate=16000,
     config_request_cls=WhatsAppConfigurationRequest,

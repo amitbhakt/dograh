@@ -4,7 +4,7 @@ import 'react-international-phone/style.css';
 
 import { Clock, Loader2, PhoneOff } from "lucide-react";
 import { useRouter } from "next/navigation";
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { PhoneInput } from 'react-international-phone';
 
 import {
@@ -100,6 +100,14 @@ export const PhoneCallDialog = ({
     const [waDeliveryError, setWaDeliveryError] = useState<string | null>(null);
     const [waCanRequest, setWaCanRequest] = useState<boolean>(true);
     const [waRequestLimitReason, setWaRequestLimitReason] = useState<string | null>(null);
+    // The recipient the current WhatsApp permission status describes, as
+    // `configId|phone`. Consent is per recipient, so a status is only ever
+    // allowed to gate a call to the exact recipient it was fetched for.
+    const [waPermissionFor, setWaPermissionFor] = useState<string | null>(null);
+    // Bumped whenever the recipient changes or a new check starts, so a reply
+    // belonging to a previous recipient can be recognised and dropped.
+    const waRequestSeqRef = useRef(0);
+    const waAbortRef = useRef<AbortController | null>(null);
     const [requestingWaPermission, setRequestingWaPermission] = useState(false);
     const [customWaMessage, setCustomWaMessage] = useState<string>("");
     const [showCustomWaMessage, setShowCustomWaMessage] = useState<boolean>(false);
@@ -109,6 +117,10 @@ export const PhoneCallDialog = ({
     const [callStatus, setCallStatus] = useState<"idle" | "calling" | "connected" | "ended" | "failed">("idle");
     const [callDuration, setCallDuration] = useState<number>(0);
     const [endingCall, setEndingCall] = useState<boolean>(false);
+    // Set when /end-call returns 200 but the provider never confirmed the
+    // hang-up. The backend preserves the call's identity for exactly this
+    // case, so keep a way to re-issue it rather than hiding the button.
+    const [providerHangupUnconfirmed, setProviderHangupUnconfirmed] = useState<boolean>(false);
 
     const fetchPreferences = useCallback(async () => {
         const result =
@@ -266,6 +278,38 @@ export const PhoneCallDialog = ({
     const selectedConfigBlocked =
         selectedConfig !== undefined && !isCallable(selectedConfig);
 
+    // Permission is only ever evidence about the recipient it was fetched for,
+    // so the gate matches the status against the recipient on screen right now.
+    const waPermissionKey = `${selectedConfigId}|${phoneNumber.trim()}`;
+    const waPermissionGranted =
+        waPermissionStatus === "granted" && waPermissionFor === waPermissionKey;
+
+    const callIsActive = callStatus === "calling" || callStatus === "connected";
+
+    /**
+     * Single gate for every way this dialog can be dismissed.
+     *
+     * While a call is live the footer deliberately offers no Close — End Call
+     * is the only way out, because `activeRunId` lives in this component and
+     * nothing else in the app can hang the call up once it is gone. Escape,
+     * a click on the overlay and the corner X all reach us through Radix's
+     * `onOpenChange`, so honouring that same rule here (rather than clearing
+     * state on close) keeps the one escape hatch consistent instead of adding
+     * a second, silent one that strands the call on the provider.
+     *
+     * Returns whether the dialog actually closed.
+     */
+    const requestClose = useCallback(() => {
+        if (callIsActive) {
+            setCallError(
+                "End the call before closing. Closing now would leave the call running on the provider with no way to hang it up from here.",
+            );
+            return false;
+        }
+        onOpenChange(false);
+        return true;
+    }, [callIsActive, onOpenChange]);
+
     const nonSipConfigs = telephonyConfigs.filter(
         (config) => config.connectivity !== "sip" && !config.inactive,
     );
@@ -279,25 +323,65 @@ export const PhoneCallDialog = ({
         telephonyConfigs.length === 0 ||
         (hasPendingOutbound && !telephonyConfigs.some(isCallable) && nonSipConfigs.length === 0);
 
+    /**
+     * Drop whatever we knew about WhatsApp permission and abandon any check
+     * still in flight.
+     *
+     * Consent is granted per recipient, so the moment the recipient or the
+     * configuration changes the previous answer stops being evidence about the
+     * new one. Bumping the sequence number orphans the in-flight reply as well,
+     * so a slow response for the previous recipient can never land on the
+     * current one.
+     */
+    const invalidateWaPermission = useCallback((nextStatus: string) => {
+        waRequestSeqRef.current += 1;
+        waAbortRef.current?.abort();
+        waAbortRef.current = null;
+        setWaPermissionStatus(nextStatus);
+        setWaPermissionFor(null);
+        setWaHoursRemaining(null);
+        setWaRestrictedReason(null);
+        setWaDeliveryError(null);
+        setWaCanRequest(true);
+        setWaRequestLimitReason(null);
+    }, []);
+
     const checkWhatsAppPermissionNow = useCallback(async (phone: string, configId: string) => {
         const raw = phone.trim();
         if (!raw || raw.length < 8 || !configId) return;
 
+        // This request owns the permission state only until a newer one (or an
+        // invalidation) starts. Everything below is guarded on that.
+        waRequestSeqRef.current += 1;
+        const seq = waRequestSeqRef.current;
+        const isCurrent = () => waRequestSeqRef.current === seq;
+
+        waAbortRef.current?.abort();
+        const controller = new AbortController();
+        waAbortRef.current = controller;
+
+        const permissionKey = `${configId}|${raw}`;
         setWaPermissionStatus("checking");
+        setWaPermissionFor(null);
         try {
             const token = await getAccessToken();
+            if (!isCurrent()) return;
             const headers: Record<string, string> = token
                 ? { Authorization: `Bearer ${token}` }
                 : {};
             const res = await fetch(
                 `/api/v1/telephony/whatsapp/permissions/check?telephony_configuration_id=${configId}&recipient_phone_number=${encodeURIComponent(raw)}`,
-                { headers }
+                { headers, signal: controller.signal }
             );
+            if (!isCurrent()) return;
             if (!res.ok) {
                 setWaPermissionStatus("not_requested");
+                setWaPermissionFor(permissionKey);
                 return;
             }
             const data = await res.json().catch(() => ({}));
+            if (!isCurrent()) return;
+            setWaPermissionFor(permissionKey);
             if (data.restricted_country) {
                 setWaPermissionStatus("restricted");
                 setWaRestrictedReason(data.restriction_reason);
@@ -315,45 +399,44 @@ export const PhoneCallDialog = ({
                 setWaRequestLimitReason(data.request_limit_reason || null);
             }
         } catch {
+            if (!isCurrent()) return;
             setWaPermissionStatus("not_requested");
+            setWaPermissionFor(permissionKey);
+        } finally {
+            if (waAbortRef.current === controller) {
+                waAbortRef.current = null;
+            }
         }
     }, [getAccessToken]);
 
-    // Check WhatsApp call permission when number or config changes
+    // Check WhatsApp call permission when number or config changes.
+    //
+    // The status is invalidated synchronously on every change, before the
+    // debounce even starts: leaving a stale "granted" on screen for 500ms is
+    // long enough for a user to press Start Call and place an unconsented call
+    // to the new recipient.
     useEffect(() => {
         if (!open || !isWhatsApp || !selectedConfigId) {
-            setWaPermissionStatus("idle");
-            setWaHoursRemaining(null);
-            setWaRestrictedReason(null);
+            invalidateWaPermission("idle");
             return;
         }
 
         const raw = phoneNumber.trim();
-        if (!raw || raw.length < 5) {
-            setWaPermissionStatus("idle");
-            setWaHoursRemaining(null);
-            setWaRestrictedReason(null);
+        if (!raw || raw.length < 8) {
+            invalidateWaPermission("idle");
             return;
         }
 
-        setWaRestrictedReason(null);
-        if (raw.length < 8) {
-            setWaPermissionStatus("idle");
-            return;
-        }
+        invalidateWaPermission("checking");
 
-        let cancelled = false;
-        const timer = setTimeout(async () => {
-            if (!cancelled) {
-                await checkWhatsAppPermissionNow(raw, selectedConfigId);
-            }
+        const timer = setTimeout(() => {
+            void checkWhatsAppPermissionNow(raw, selectedConfigId);
         }, 500);
 
         return () => {
-            cancelled = true;
             clearTimeout(timer);
         };
-    }, [open, isWhatsApp, selectedConfigId, phoneNumber, checkWhatsAppPermissionNow]);
+    }, [open, isWhatsApp, selectedConfigId, phoneNumber, checkWhatsAppPermissionNow, invalidateWaPermission]);
 
     // Load saved default permission message from configuration
     useEffect(() => {
@@ -413,7 +496,13 @@ export const PhoneCallDialog = ({
                     data.detail || `Failed to send WhatsApp call permission request (${res.status} ${res.statusText || ""})`
                 );
             }
+            // Supersede any check still in flight so its (pre-request) answer
+            // cannot overwrite the pending state we just created.
+            waRequestSeqRef.current += 1;
+            waAbortRef.current?.abort();
+            waAbortRef.current = null;
             setWaPermissionStatus("pending");
+            setWaPermissionFor(`${selectedConfigId}|${phoneNumber.trim()}`);
             setWaHoursRemaining(168);
             setWaDeliveryError(null);
         } catch (err: any) {
@@ -424,7 +513,7 @@ export const PhoneCallDialog = ({
     };
 
     const goToConfiguration = (target?: { configId?: number; add?: boolean }) => {
-        onOpenChange(false);
+        if (!requestClose()) return;
         if (target?.configId) {
             router.push(`/telephony-configurations/${target.configId}`);
             return;
@@ -477,19 +566,51 @@ export const PhoneCallDialog = ({
     const handleEndCall = async () => {
         if (!activeRunId) return;
         setEndingCall(true);
+        setCallError(null);
+        setProviderHangupUnconfirmed(false);
         try {
             const token = await getAccessToken();
             const headers: Record<string, string> = {
                 "Content-Type": "application/json",
                 ...(token ? { Authorization: `Bearer ${token}` } : {}),
             };
-            await fetch(`/api/v1/telephony/runs/${activeRunId}/end-call`, {
+            const res = await fetch(`/api/v1/telephony/runs/${activeRunId}/end-call`, {
                 method: "POST",
                 headers,
             });
+            if (!res.ok) {
+                const data = await res.json().catch(() => ({}));
+                const detail =
+                    typeof data?.detail === "string" ? data.detail : null;
+                throw new Error(
+                    detail ||
+                        `Failed to end the call (${res.status}${res.statusText ? ` ${res.statusText}` : ""}).`,
+                );
+            }
+            // A 200 does not necessarily mean the carrier hung up: the backend
+            // reports "partial" when it tore down our side but the provider
+            // never confirmed. Mark the run ended (it is closed server-side)
+            // but tell the user the recipient may still be connected.
+            const body = await res.json().catch(() => ({}));
             setCallStatus("ended");
+            const unconfirmed = body?.provider_terminated === false;
+            setProviderHangupUnconfirmed(unconfirmed);
+            if (unconfirmed) {
+                setCallError(
+                    typeof body?.message === "string"
+                        ? body.message
+                        : "The call was closed on our side, but the provider did not confirm the hang-up.",
+                );
+            }
         } catch (err: unknown) {
             console.error("Failed to end call:", err);
+            // The provider call is very likely still live, so keep callStatus
+            // where it is: polling continues and End Call stays available to
+            // retry. Marking it "ended" here would hide a call nobody can now
+            // hang up.
+            setCallError(
+                `${err instanceof Error ? err.message : "Failed to end the call."} The call may still be in progress — try again.`,
+            );
         } finally {
             setEndingCall(false);
         }
@@ -554,6 +675,8 @@ export const PhoneCallDialog = ({
     }, [callStatus]);
 
     const handleStartCall = async () => {
+        // A new call supersedes any unresolved hang-up from the previous one.
+        setProviderHangupUnconfirmed(false);
         if (isWhatsApp) {
             if (waPermissionStatus === "restricted") {
                 setCallError(
@@ -562,7 +685,7 @@ export const PhoneCallDialog = ({
                 );
                 return;
             }
-            if (waPermissionStatus !== "granted") {
+            if (!waPermissionGranted) {
                 setCallError(
                     "Permission to call this WhatsApp number has not been granted by the recipient. Please send a permission request first.",
                 );
@@ -734,7 +857,7 @@ export const PhoneCallDialog = ({
                 </div>
 
                 <DialogFooter>
-                    <Button variant="ghost" onClick={() => onOpenChange(false)}>
+                    <Button variant="ghost" onClick={() => requestClose()}>
                         Do it Later
                     </Button>
                 </DialogFooter>
@@ -867,7 +990,7 @@ export const PhoneCallDialog = ({
                             Checking WhatsApp call permission with Meta...
                         </div>
                     )}
-                    {waPermissionStatus === "granted" && (
+                    {waPermissionGranted && (
                         <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs text-emerald-700 dark:text-emerald-400">
                             <div className="font-semibold mb-0.5 flex items-center gap-1.5">
                                 <span>✓</span> WhatsApp Call Permission Granted
@@ -1116,8 +1239,14 @@ export const PhoneCallDialog = ({
             <DialogFooter className="flex-col sm:flex-row gap-2">
                 <Button
                     variant="outline"
+                    disabled={callIsActive}
+                    title={
+                        callIsActive
+                            ? "End the call before leaving this dialog"
+                            : undefined
+                    }
                     onClick={() => {
-                        onOpenChange(false);
+                        if (!requestClose()) return;
                         router.push('/telephony-configurations');
                     }}
                 >
@@ -1130,7 +1259,7 @@ export const PhoneCallDialog = ({
                         </DialogClose>
                     )}
                     {callStatus === "idle" ? (
-                        isWhatsApp && waPermissionStatus !== "granted" ? (
+                        isWhatsApp && !waPermissionGranted ? (
                             <TooltipProvider>
                                 <Tooltip>
                                     <TooltipTrigger asChild>
@@ -1170,7 +1299,7 @@ export const PhoneCallDialog = ({
                             >
                                 Call Again
                             </Button>
-                            {(callStatus === "calling" || callStatus === "connected") ? (
+                            {(callStatus === "calling" || callStatus === "connected" || providerHangupUnconfirmed) ? (
                                 <Button
                                     variant="destructive"
                                     onClick={handleEndCall}
@@ -1189,7 +1318,7 @@ export const PhoneCallDialog = ({
                                     )}
                                 </Button>
                             ) : (
-                                <Button onClick={() => onOpenChange(false)}>
+                                <Button onClick={() => requestClose()}>
                                     Close
                                 </Button>
                             )}
@@ -1203,7 +1332,16 @@ export const PhoneCallDialog = ({
     );
 
     return (
-        <Dialog open={open} onOpenChange={onOpenChange}>
+        <Dialog
+            open={open}
+            onOpenChange={(next) => {
+                if (next) {
+                    onOpenChange(true);
+                    return;
+                }
+                requestClose();
+            }}
+        >
             <DialogContent>
                 {checkingConfig || needsConfiguration === null
                     ? renderLoading()

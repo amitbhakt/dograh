@@ -155,7 +155,11 @@ export default function EditCampaignPage() {
                 setFromNumbersCount(defaultsRes.data.from_numbers_count);
             }
             if (configsRes.data) {
-                setTelephonyConfigs(configsRes.data);
+                // The endpoint returns { configurations: [...] }, not a bare
+                // array — assigning the envelope left `telephonyConfigs` as an
+                // object, so the `.find` below threw and no configuration was
+                // ever matched to the campaign.
+                setTelephonyConfigs(configsRes.data.configurations ?? []);
             }
         } catch (error) {
             console.error('Failed to fetch campaign limits:', error);
@@ -173,11 +177,17 @@ export default function EditCampaignPage() {
     const matchingConfig = telephonyConfigs.find(
         (tc) => tc.id === campaign?.telephony_configuration_id
     );
-    const isWhatsApp = Boolean(
-        matchingConfig?.provider === 'whatsapp' ||
-        campaign?.telephony_configuration_name?.toLowerCase().includes('whatsapp') ||
-        (campaign as any)?.whatsapp_permission_action !== undefined
-    );
+    // The telephony provider is the only thing that actually makes a campaign a
+    // WhatsApp campaign.
+    //
+    // The name heuristic matched any configuration a user happened to call
+    // "whatsapp", and `whatsapp_permission_action !== undefined` matched
+    // everything: CampaignResponse declares that field with a "skip" default
+    // and always populates it (api/routes/campaign.py), so it is present on
+    // every campaign. Between them, every campaign was treated as WhatsApp —
+    // showing the permission card, capping effective concurrency at 1 and
+    // submitting WhatsApp metadata on plain voice campaigns.
+    const isWhatsApp = matchingConfig?.provider === 'whatsapp';
     const effectiveFromNumbers = isWhatsApp ? 1 : (matchingConfig?.phone_number_count ?? fromNumbersCount);
 
     // Effective concurrency limit

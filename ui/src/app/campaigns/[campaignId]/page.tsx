@@ -14,9 +14,10 @@ import {
     redialCampaignApiV1CampaignCampaignIdRedialPost,
     resumeCampaignApiV1CampaignCampaignIdResumePost,
     startCampaignApiV1CampaignCampaignIdStartPost,
+    listTelephonyConfigurationsApiV1OrganizationsTelephonyConfigsGet,
     syncWhatsAppPermissionsApiV1CampaignCampaignIdSyncWhatsappPermissionsPost,
 } from '@/client/sdk.gen';
-import type { CampaignResponse } from '@/client/types.gen';
+import type { CampaignResponse, TelephonyConfigurationListItem } from '@/client/types.gen';
 import { Badge } from '@/components/ui/badge';
 import { Button } from '@/components/ui/button';
 import { Calendar } from '@/components/ui/calendar';
@@ -64,6 +65,9 @@ export default function CampaignDetailPage() {
     const [reportEndTime, setReportEndTime] = useState('23:59');
     const [isReportPopoverOpen, setIsReportPopoverOpen] = useState(false);
 
+    // Telephony configurations, needed to know the campaign's actual provider
+    const [telephonyConfigs, setTelephonyConfigs] = useState<TelephonyConfigurationListItem[]>([]);
+
     // Redial dialog state
     const [isRedialDialogOpen, setIsRedialDialogOpen] = useState(false);
     const [redialName, setRedialName] = useState('');
@@ -98,10 +102,27 @@ export default function CampaignDetailPage() {
         }
     }, [user, getAccessToken, campaignId]);
 
+    // Telephony configurations carry the provider, which the campaign response
+    // does not; it is what decides whether this is a WhatsApp campaign.
+    const fetchTelephonyConfigs = useCallback(async () => {
+        if (!user) return;
+        try {
+            const accessToken = await getAccessToken();
+            const res = await listTelephonyConfigurationsApiV1OrganizationsTelephonyConfigsGet({
+                headers: { 'Authorization': `Bearer ${accessToken}` },
+            });
+            // The endpoint returns { configurations: [...] }, not a bare array.
+            setTelephonyConfigs(res.data?.configurations ?? []);
+        } catch (error) {
+            console.error('Failed to fetch telephony configurations:', error);
+        }
+    }, [user, getAccessToken]);
+
     // Initial load
     useEffect(() => {
         fetchCampaign();
-    }, [fetchCampaign]);
+        fetchTelephonyConfigs();
+    }, [fetchCampaign, fetchTelephonyConfigs]);
 
     // Handle back navigation
     const handleBack = () => {
@@ -420,10 +441,13 @@ export default function CampaignDetailPage() {
 
     const canEdit = campaign && ['created', 'running', 'paused'].includes(campaign.state);
 
-    const isWhatsAppCampaign = Boolean(
-        campaign?.telephony_configuration_name?.toLowerCase().includes('whatsapp') ||
-        (campaign as any)?.whatsapp_permission_action
-    );
+    // The telephony provider is the only thing that makes a campaign a WhatsApp
+    // campaign. The previous check also accepted a truthy whatsapp_permission_action,
+    // but the API always sends that field (defaulting to "skip"), so every campaign
+    // matched; and a configuration merely *named* "whatsapp" proves nothing.
+    const isWhatsAppCampaign =
+        telephonyConfigs.find((tc) => tc.id === campaign?.telephony_configuration_id)
+            ?.provider === 'whatsapp';
 
     // Newest entries first. The backend appends chronologically; the UI is more
     // useful when the most recent failure / pause is at the top.

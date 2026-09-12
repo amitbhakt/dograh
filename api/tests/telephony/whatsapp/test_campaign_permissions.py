@@ -14,7 +14,8 @@ Tests:
 
 import asyncio
 import json
-from datetime import datetime, timezone, timedelta
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timezone, timedelta
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -836,7 +837,9 @@ class TestWhatsAppPermissionFixes(IsolatedAsyncioTestCase):
         self.assertIsNone(parse_whatsapp_expiration(""))
         self.assertIsNone(parse_whatsapp_expiration("invalid-date"))
 
-    @patch("api.services.telephony.providers.whatsapp.routes._get_or_create_whatsapp_client")
+    # provider.send_call_permission_request imports the client factory from
+    # .service at call time, so .routes is not the binding it reads.
+    @patch("api.services.telephony.providers.whatsapp.service.get_or_create_whatsapp_client")
     @patch("api.db.db_client")
     async def test_send_permission_request_persists_pending_record(self, mock_db, mock_get_client):
         """Issue 1: send_call_permission_request persists pending WhatsAppCallPermissionModel with message ID."""

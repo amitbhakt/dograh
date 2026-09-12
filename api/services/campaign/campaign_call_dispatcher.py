@@ -34,6 +34,34 @@ if TYPE_CHECKING:
     from api.services.telephony.base import TelephonyProvider
 
 
+# Retry reasons a queued run can carry while it is still waiting to be dialled.
+# "awaiting_<provider>_permission" is written when the run is parked pending
+# recipient consent; "permission_granted" is written by the activation path
+# (db_client.activate_queued_run_for_immediate_dial, reached from the WhatsApp
+# webhook and the Meta permission sync) once consent arrives. Both leave the
+# run in state "queued" for a later batch to dial.
+PERMISSION_GRANTED_RETRY_REASON = "permission_granted"
+
+
+def _is_awaiting_permission_retry_reason(retry_reason: Optional[str]) -> bool:
+    """True for the provider-scoped parked reason, e.g. awaiting_whatsapp_permission."""
+    return bool(
+        retry_reason
+        and retry_reason.startswith("awaiting_")
+        and retry_reason.endswith("_permission")
+    )
+
+
+def _is_awaiting_dial(queued_run: Optional[QueuedRunModel]) -> bool:
+    """True when a queued run must stay queued for a later batch to dial it."""
+    if not queued_run or queued_run.state != "queued":
+        return False
+    retry_reason = queued_run.retry_reason
+    return retry_reason == PERMISSION_GRANTED_RETRY_REASON or (
+        _is_awaiting_permission_retry_reason(retry_reason)
+    )
+
+
 class CampaignCallDispatcher:
     """Manages rate-limited and concurrent-limited call dispatching"""
 
@@ -116,125 +144,182 @@ class CampaignCallDispatcher:
 
         processed_count = 0
         processed_run_ids: set[int] = set()
-        for i, queued_run in enumerate(queued_runs):
-            try:
-                # Apply rate limiting, i.e lets not initiate more than rate_limit_per_second
-                # calls per second. It is different than concurrency limit.
-                await self.apply_rate_limit(
-                    campaign.organization_id, campaign.rate_limit_per_second
-                )
-
-                # Acquire concurrent slot - waits until a slot is available
-                concurrency_slot = await self.acquire_concurrent_slot(
-                    campaign.organization_id, campaign
-                )
-
-                # Dispatch the call
-                workflow_run = await self.dispatch_call(
-                    queued_run, campaign, concurrency_slot
-                )
-
-                # Check if queued run was parked (e.g. awaiting WhatsApp call permission)
-                current_queued_run = await db_client.get_queued_run_by_id(queued_run.id)
-                is_parked = (
-                    current_queued_run
-                    and current_queued_run.state == "queued"
-                    and current_queued_run.retry_reason == "awaiting_whatsapp_permission"
-                )
-
-                if is_parked:
-                    # Keep parked in queued state
-                    processed_run_ids.add(queued_run.id)
-                    logger.info(
-                        f"[Campaign {campaign_id}] Queued run {queued_run.id} remains parked "
-                        "awaiting WhatsApp call permission"
-                    )
-                else:
-                    # Update queued run as processed
-                    await db_client.update_queued_run(
-                        queued_run_id=queued_run.id,
-                        state="processed",
-                        processed_at=datetime.now(UTC),
-                    )
-
-                    processed_count += 1
-                    processed_run_ids.add(queued_run.id)
-
-                    # Update campaign processed count
-                    await db_client.update_campaign(
-                        campaign_id=campaign_id, processed_rows=campaign.processed_rows + 1
-                    )
-
-            except asyncio.CancelledError:
-                logger.warning(
-                    f"Campaign {campaign_id} batch cancelled; returning claimed "
-                    "queued runs that were not dispatched"
-                )
-                await self._return_unprocessed_claims(
-                    queued_runs, processed_run_ids, reason="task_cancelled"
-                )
-                raise
-
-            except OutboundReadinessError as e:
-                logger.warning(
-                    f"Outbound setup is incomplete for campaign {campaign_id}; "
-                    "returning claimed queued runs without dispatching calls: "
-                    f"{e}"
-                )
-                await self._return_unprocessed_claims(
-                    queued_runs,
-                    processed_run_ids,
-                    reason="outbound_readiness_failed",
-                )
-                raise
-
-            except PhoneNumberPoolExhaustedError as e:
-                logger.warning(
-                    f"Phone number pool exhausted for campaign {campaign_id}; "
-                    "returning claimed queued runs that were not dispatched: "
-                    f"{e}"
-                )
-                await self._return_unprocessed_claims(
-                    queued_runs,
-                    processed_run_ids,
-                    reason="phone_number_pool_exhausted",
-                )
-                # Re-raise to propagate to process_campaign_batch
-                raise
-
-            except ConcurrentSlotAcquisitionError as e:
-                logger.warning(
-                    f"Concurrent slot acquisition failed for campaign {campaign_id}; "
-                    "returning claimed queued runs that were not dispatched: "
-                    f"{e}"
-                )
-                await self._return_unprocessed_claims(
-                    queued_runs,
-                    processed_run_ids,
-                    reason="concurrent_slot_acquisition_failed",
-                )
-                # Re-raise to propagate to process_campaign_batch
-                raise
-
-            except Exception as e:
-                logger.warning(f"Error processing queued run {queued_run.id}: {e}")
-
-                # Mark the queued run as failed to prevent infinite retry loops
+        # Accumulated over the batch and written once, so a single stale
+        # campaign snapshot can't be used to write the same value N times.
+        pending_processed_rows = 0
+        try:
+            for i, queued_run in enumerate(queued_runs):
                 try:
-                    await db_client.update_queued_run(
-                        queued_run_id=queued_run.id,
-                        state="failed",
-                        processed_at=datetime.now(UTC),
+                    # Apply rate limiting, i.e lets not initiate more than rate_limit_per_second
+                    # calls per second. It is different than concurrency limit.
+                    await self.apply_rate_limit(
+                        campaign.organization_id, campaign.rate_limit_per_second
                     )
-                    logger.info(
-                        f"Marked queued run {queued_run.id} as failed due to error: {e}"
+
+                    # Acquire concurrent slot - waits until a slot is available
+                    concurrency_slot = await self.acquire_concurrent_slot(
+                        campaign.organization_id, campaign
                     )
-                except Exception as update_error:
-                    logger.error(
-                        f"Failed to mark queued run {queued_run.id} as failed: {update_error}"
+
+                    # Dispatch the call
+                    workflow_run = await self.dispatch_call(
+                        queued_run, campaign, concurrency_slot
                     )
+
+                    # Check whether the queued run is still waiting to be dialled
+                    # (e.g. parked awaiting WhatsApp call permission).
+                    current_queued_run = await db_client.get_queued_run_by_id(queued_run.id)
+                    is_awaiting_dial = _is_awaiting_dial(current_queued_run)
+
+                    if is_awaiting_dial:
+                        # Keep in queued state so a later batch dials it. This
+                        # covers both the freshly parked run and one whose
+                        # permission was granted between dispatch and this read
+                        # (the activation path rewrites retry_reason to
+                        # "permission_granted" while leaving state "queued");
+                        # marking that run processed would silently drop its dial.
+                        processed_run_ids.add(queued_run.id)
+                        logger.info(
+                            f"[Campaign {campaign_id}] Queued run {queued_run.id} stays queued "
+                            f"(retry_reason={current_queued_run.retry_reason}) awaiting dial"
+                        )
+                    else:
+                        # Update queued run as processed
+                        await db_client.update_queued_run(
+                            queued_run_id=queued_run.id,
+                            state="processed",
+                            processed_at=datetime.now(UTC),
+                        )
+
+                        processed_count += 1
+                        processed_run_ids.add(queued_run.id)
+
+                        # Campaign processed count is accumulated and flushed
+                        # once for the whole batch below - writing
+                        # ``campaign.processed_rows + 1`` per item would store
+                        # the same value N times off one stale snapshot.
+                        pending_processed_rows += 1
+
+                except asyncio.CancelledError:
+                    logger.warning(
+                        f"Campaign {campaign_id} batch cancelled; returning claimed "
+                        "queued runs that were not dispatched"
+                    )
+                    await self._return_unprocessed_claims(
+                        queued_runs, processed_run_ids, reason="task_cancelled"
+                    )
+                    raise
+
+                except OutboundReadinessError as e:
+                    logger.warning(
+                        f"Outbound setup is incomplete for campaign {campaign_id}; "
+                        "returning claimed queued runs without dispatching calls: "
+                        f"{e}"
+                    )
+                    await self._return_unprocessed_claims(
+                        queued_runs,
+                        processed_run_ids,
+                        reason="outbound_readiness_failed",
+                    )
+                    raise
+
+                except PhoneNumberPoolExhaustedError as e:
+                    logger.warning(
+                        f"Phone number pool exhausted for campaign {campaign_id}; "
+                        "returning claimed queued runs that were not dispatched: "
+                        f"{e}"
+                    )
+                    await self._return_unprocessed_claims(
+                        queued_runs,
+                        processed_run_ids,
+                        reason="phone_number_pool_exhausted",
+                    )
+                    # Re-raise to propagate to process_campaign_batch
+                    raise
+
+                except ConcurrentSlotAcquisitionError as e:
+                    logger.warning(
+                        f"Concurrent slot acquisition failed for campaign {campaign_id}; "
+                        "returning claimed queued runs that were not dispatched: "
+                        f"{e}"
+                    )
+                    await self._return_unprocessed_claims(
+                        queued_runs,
+                        processed_run_ids,
+                        reason="concurrent_slot_acquisition_failed",
+                    )
+                    # Re-raise to propagate to process_campaign_batch
+                    raise
+
+                except Exception as e:
+                    logger.warning(f"Error processing queued run {queued_run.id}: {e}")
+
+                    # Mark the queued run as failed to prevent infinite retry loops
+                    try:
+                        await db_client.update_queued_run(
+                            queued_run_id=queued_run.id,
+                            state="failed",
+                            processed_at=datetime.now(UTC),
+                        )
+                        logger.info(
+                            f"Marked queued run {queued_run.id} as failed due to error: {e}"
+                        )
+                    except Exception as update_error:
+                        logger.error(
+                            f"Failed to mark queued run {queued_run.id} as failed: {update_error}"
+                        )
+        finally:
+            # Flush on every exit path (including the re-raised errors above)
+            # so dispatched calls are never missing from the progress counter.
+            await self._flush_processed_rows(campaign_id, pending_processed_rows)
 
         return processed_count
+
+    async def _flush_processed_rows(self, campaign_id: int, delta: int) -> None:
+        """Add ``delta`` to the campaign's processed_rows counter.
+
+        The increment happens SQL-side, so a permission denial bumping the same
+        counter concurrently cannot be lost: reading the row here and writing
+        back ``current + delta`` would drop whichever write landed in between.
+
+        The runs are already marked processed by the time this runs, so simply
+        logging a failure would strand the delta forever. ``processed_rows`` is
+        a cache of queued-run state, not an independent fact, so a failed
+        increment falls back to recomputing it from those rows - which converges
+        on the truth instead of re-applying a delta against an unknown base.
+        """
+        if delta <= 0:
+            return
+
+        try:
+            await db_client.increment_campaign_processed_rows(
+                campaign_id=campaign_id, delta=delta
+            )
+            return
+        except Exception as e:
+            logger.error(
+                f"Failed to increment processed_rows for campaign {campaign_id} "
+                f"by {delta}: {e}; reconciling from queued-run state instead."
+            )
+
+        try:
+            actual = await db_client.get_queued_runs_count(
+                campaign_id=campaign_id, states=["processed", "failed"]
+            )
+            await db_client.update_campaign(
+                campaign_id=campaign_id, processed_rows=actual
+            )
+            logger.info(
+                f"Reconciled processed_rows for campaign {campaign_id} to {actual} "
+                "from queued-run state."
+            )
+        except Exception as reconcile_err:
+            logger.error(
+                f"Could not reconcile processed_rows for campaign {campaign_id}: "
+                f"{reconcile_err}. Progress will under-report by {delta} until the "
+                "next successful flush; queued-run state remains authoritative and "
+                "campaign completion is unaffected (it is driven by queued counts)."
+            )
 
     async def _return_unprocessed_claims(
         self,

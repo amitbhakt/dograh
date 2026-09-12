@@ -292,13 +292,26 @@ class CallConcurrencyService:
             )
             if from_number_mapping:
                 fn_org_id, from_number, config_id = from_number_mapping
-                await rate_limiter.release_from_number(
+                fn_released = await rate_limiter.release_from_number(
                     fn_org_id, from_number, telephony_configuration_id=config_id
                 )
-                await rate_limiter.delete_workflow_from_number_mapping(workflow_run_id)
-                logger.debug(
-                    f"Released mapped from_number {from_number} for workflow run {workflow_run_id}"
-                )
+                if fn_released:
+                    await rate_limiter.delete_workflow_from_number_mapping(
+                        workflow_run_id
+                    )
+                    logger.debug(
+                        f"Released mapped from_number {from_number} for workflow run {workflow_run_id}"
+                    )
+                else:
+                    # release_from_number returns False both when the
+                    # number was already released and on a Redis error;
+                    # keep the mapping either way so a later cleanup pass
+                    # can retry the release instead of leaking the
+                    # from_number if this was a transient failure.
+                    logger.warning(
+                        f"Failed to release from_number {from_number} for workflow "
+                        f"run {workflow_run_id}; keeping mapping for retry"
+                    )
         except Exception as e:
             logger.warning(
                 f"Error releasing from_number for workflow run {workflow_run_id}: {e}"

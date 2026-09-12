@@ -45,6 +45,10 @@ ENV BACKEND_URL="http://api:8000"
 # Build the application with standalone mode
 # Increase Node.js heap size to prevent out-of-memory errors during build
 ENV NODE_OPTIONS="--max-old-space-size=2560"
+# Type-checking and linting are CI's job, not the image's: next.config.ts only
+# skips them when this is set, and running them here risks the OOM the heap
+# bump above exists to avoid.
+ENV NEXT_SKIP_BUILD_CHECKS="1"
 RUN npm run build && \
     rm -rf /tmp/* /root/.npm
 

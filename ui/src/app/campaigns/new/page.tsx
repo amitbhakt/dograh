@@ -83,7 +83,7 @@ export default function NewCampaignPage() {
     const [circuitBreakerFailureThreshold, setCircuitBreakerFailureThreshold] = useState<string>('50');
     const [circuitBreakerWindowSeconds, setCircuitBreakerWindowSeconds] = useState<string>('120');
     const [circuitBreakerMinCalls, setCircuitBreakerMinCalls] = useState<string>('5');
-    const [whatsappPermissionAction, setWhatsappPermissionAction] = useState<string>('skip');
+    const [whatsappPermissionAction, setWhatsappPermissionAction] = useState<'skip' | 'request_and_wait'>('skip');
 
     // Redirect if not authenticated
     useEffect(() => {

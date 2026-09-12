@@ -29,6 +29,7 @@ from api.services.observability.active_calls import (
     unregister_active_call as unregister_worker_active_call,
 )
 from api.services.pipecat.audio_config import AudioConfig, create_audio_config
+from api.services.pipecat.call_gate import OutboundCallGate  # noqa: F401 -- annotation
 from api.services.pipecat.event_handlers import (
     register_audio_data_handler,
     register_event_handlers,
@@ -416,7 +417,7 @@ async def run_pipeline_smallwebrtc(
     call_context_vars: dict = {},
     user_provider_id: str | None = None,
     organization_id: int | None = None,
-    call_answered_event: asyncio.Event | None = None,
+    call_answered_event: "OutboundCallGate | None" = None,
 ) -> None:
     """Run pipeline for WebRTC connections."""
     # Register before any async setup so deploy drains see calls that are still
@@ -448,7 +449,7 @@ async def _run_pipeline_smallwebrtc_impl(
     call_context_vars: dict = {},
     user_provider_id: str | None = None,
     organization_id: int | None = None,
-    call_answered_event: asyncio.Event | None = None,
+    call_answered_event: "OutboundCallGate | None" = None,
 ) -> None:
     """Run pipeline for WebRTC connections"""
     logger.debug(
@@ -571,7 +572,7 @@ async def _run_pipeline_impl(
     workflow_run=None,
     resolved_user_config=None,
     organization_id: int | None = None,
-    call_answered_event: asyncio.Event | None = None,
+    call_answered_event: "OutboundCallGate | None" = None,
 ) -> None:
     """
     Run the pipeline with the given transport and configuration

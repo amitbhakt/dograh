@@ -3,7 +3,7 @@ import re
 from datetime import UTC, datetime
 from typing import Any, Dict, List, Optional
 
-from sqlalchemy import cast, func, or_, String, text, update
+from sqlalchemy import func, or_, text, update
 from sqlalchemy.future import select
 
 from api.db.base_client import BaseDBClient
@@ -24,53 +24,52 @@ def is_same_recipient_number(
 ) -> bool:
     """Decide whether a stored phone number refers to the same recipient as the target.
 
-    Campaign leads arrive in whatever shape the customer uploaded them - with or
-    without a country code, with or without punctuation - so equality alone is
-    not enough. The target derivations are passed in precomputed because this
-    runs once per candidate row.
+    This is a *consent* gate, not a data-cleanup helper: the caller acts on the
+    result by activating or failing a parked campaign run on the strength of a
+    permission webhook. A false positive therefore dials someone who never
+    consented, or cancels someone else's lead on a stranger's refusal. So the
+    rule is full-number equality on the canonical digits and nothing else. The
+    only differences forgiven are punctuation and a leading "+", because
+    neither carries any information about which subscriber is meant.
+
+    In particular this deliberately does NOT infer a missing country code.
+    Both sides are guaranteed to carry one:
+
+    * Campaign leads - ``CampaignSourceSyncService.validate_source_data``
+      (api/services/campaign/source_sync.py) rejects campaign creation with a
+      400 if any CSV row's ``phone_number`` does not start with "+", so a
+      stored lead is an international number, however it is punctuated.
+    * Webhook recipients - Meta reports the recipient as a ``wa_id``, which is
+      always a full international number.
+
+    Given that, two numbers that differ by a leading 1-3 digit prefix are two
+    different subscribers, not two spellings of one: "+441234567890" (UK) and
+    "+1234567890" may well belong to unrelated people, and a grant or denial
+    from one must never move the other's run. The target derivations are passed
+    in precomputed because this runs once per candidate row.
     """
     if not candidate:
         return False
 
     candidate_digits = re.sub(r"\D", "", candidate)
 
-    # 1. Exact digit match (e.g. 15551234567 == 15551234567)
+    # 1. Canonical digit equality. Every formatting variant of one number -
+    #    "+1 (555) 123-4567", "1-555-123-4567", "+15551234567", "15551234567" -
+    #    reduces to the same digit string, so this covers punctuation and the
+    #    optional "+" without relaxing *which* number is meant.
     if candidate_digits and candidate_digits == target_digits:
         return True
 
-    # 2. Suffix match when one side carries a country code and the other does not.
-    # Two bounds keep this from reaching a different subscriber:
-    #  - the shorter side must be long enough to be a phone number in its own
-    #    right. 8 is normalize_telephony_address's own floor (_PSTN_DIGITS_RE is
-    #    8-15); below it we are looking at a local fragment with no area code,
-    #    and any longer number ending in those digits would match.
-    #  - the surplus must be shaped like a country code: 1-3 digits, never
-    #    leading with 0 (that is a national trunk prefix, not a dial code).
-    # This is still a heuristic - leads arrive without a country - so it is
-    # deliberately the narrowest rule that keeps "same number, no country code"
-    # working, not a general equivalence test.
-    if candidate_digits and target_digits:
-        if len(candidate_digits) >= len(target_digits):
-            longer, shorter = candidate_digits, target_digits
-        else:
-            longer, shorter = target_digits, candidate_digits
-        surplus = longer[: len(longer) - len(shorter)]
-        if (
-            len(shorter) >= 8
-            and 0 < len(surplus) <= 3
-            and not surplus.startswith("0")
-            and longer.endswith(shorter)
-        ):
-            return True
-
-    # 3. Canonical match using normalize_telephony_address
+    # 2. Canonical match via normalize_telephony_address. For PSTN this agrees
+    #    with (1); it matters when the target is not a PSTN number at all
+    #    (e.g. a SIP address), where comparing digit runs says nothing.
     try:
         if normalize_telephony_address(candidate).canonical == target_canonical:
             return True
     except Exception:
         pass
 
-    # 4. Leading plus-stripped string match
+    # 3. Leading plus-stripped string match, for the same non-PSTN case.
     return candidate.lstrip("+") == target_no_plus
 
 
@@ -331,10 +330,22 @@ class CampaignClient(BaseDBClient):
                     f"Campaign {parent_campaign.id} has already been redialed"
                 )
 
+            # whatsapp_permission_action is orchestrator behaviour, not a
+            # one-off of the parent run: campaign_call_dispatcher reads it with
+            # a default of "skip", so leaving it out of this allowlist silently
+            # downgrades a redial of a "request_and_wait" campaign to "skip" -
+            # the child stops asking recipients for call permission and drops
+            # every unpermitted lead instead of parking it.
             child_meta = {
                 k: v
                 for k, v in parent_meta.items()
-                if k in ("max_concurrency", "schedule_config", "circuit_breaker")
+                if k
+                in (
+                    "max_concurrency",
+                    "schedule_config",
+                    "circuit_breaker",
+                    "whatsapp_permission_action",
+                )
             }
             child_meta["parent_campaign_id"] = parent_campaign.id
 
@@ -351,6 +362,14 @@ class CampaignClient(BaseDBClient):
                     else CampaignModel.retry_config.default.arg
                 ),
                 orchestrator_metadata=child_meta,
+                # Pin the same telephony configuration as the parent. Without
+                # it the child falls back to the org's default outbound config
+                # in get_provider_for_campaign, so a redial of a WhatsApp
+                # campaign can leave via a different provider entirely - which
+                # would also make the inherited whatsapp_permission_action
+                # above inert. Same organization_id as the parent, so this
+                # references nothing outside the tenant.
+                telephony_configuration_id=parent_campaign.telephony_configuration_id,
                 rate_limit_per_second=parent_campaign.rate_limit_per_second,
                 total_rows=len(queued_runs_data),
                 source_sync_status="completed",
@@ -557,6 +576,71 @@ class CampaignClient(BaseDBClient):
                 await session.rollback()
                 raise
             return attempt
+
+    async def increment_campaign_processed_rows(
+        self, campaign_id: int, delta: int = 1
+    ) -> int:
+        """Atomically increment campaigns.processed_rows and return the new value."""
+        async with self.async_session() as session:
+            result = await session.execute(
+                text(
+                    "UPDATE campaigns "
+                    "SET processed_rows = COALESCE(processed_rows, 0) + :delta, "
+                    "    updated_at = :now "
+                    "WHERE id = :campaign_id "
+                    "RETURNING processed_rows"
+                ),
+                {
+                    "campaign_id": campaign_id,
+                    "delta": delta,
+                    "now": datetime.now(UTC),
+                },
+            )
+            processed_rows = result.scalar_one()
+            try:
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+            return processed_rows
+
+    async def merge_campaign_orchestrator_metadata(
+        self, campaign_id: int, updates: Dict[str, Any]
+    ) -> Optional[CampaignModel]:
+        """Atomically merge `updates` into campaigns.orchestrator_metadata (SQL-side jsonb ||).
+
+        A last-write-wins Python read/merge/write would drop concurrent writers'
+        keys; the jsonb `||` merge below is done entirely in SQL so concurrent
+        callers each only ever add or overwrite their own keys.
+        """
+        async with self.async_session() as session:
+            result = await session.execute(
+                text(
+                    "UPDATE campaigns "
+                    "SET orchestrator_metadata = ("
+                    "        COALESCE(orchestrator_metadata::jsonb, '{}'::jsonb) "
+                    "        || CAST(:updates AS jsonb)"
+                    "    )::json, "
+                    "    updated_at = :now "
+                    "WHERE id = :campaign_id "
+                    "RETURNING id"
+                ),
+                {
+                    "campaign_id": campaign_id,
+                    "updates": json.dumps(updates),
+                    "now": datetime.now(UTC),
+                },
+            )
+            row = result.scalar_one_or_none()
+            if row is None:
+                await session.rollback()
+                return None
+            try:
+                await session.commit()
+            except Exception:
+                await session.rollback()
+                raise
+            return await session.get(CampaignModel, campaign_id)
 
     async def reset_campaign_metadata_counter(self, campaign_id: int, key: str) -> None:
         """Remove a counter field from campaign orchestrator_metadata."""
@@ -965,19 +1049,25 @@ class CampaignClient(BaseDBClient):
             QueuedRunModel.context_variables["phone_number"].as_string() == target_no_plus,
         ]
 
-        # Add substring/suffix filter on context_variables JSON text to catch
-        # formatted variants (e.g. "+1 (555) 123-4567" or "1-555-123-4567"),
-        # where punctuation stops the full digit string from appearing verbatim.
-        # These are a deliberately wide *prefilter* only: every row they return
-        # is re-checked below against context_variables["phone_number"] alone,
-        # so a digit run matching some other field never survives.
-        if len(target_digits) >= 7:
+        # Formatted variants ("+1 (555) 123-4567", "+33 6 12 34 56 78") never
+        # equal any of the strings above, so compare the stored number with its
+        # punctuation removed - exactly the reduction is_same_recipient_number
+        # performs in Python. This replaces the previous last-7 / last-4 digit
+        # ILIKE prefilter, which had a real recall hole: punctuation inside the
+        # trailing digits defeats both windows at once. "+33 6 12 34 56 78"
+        # contains neither "2345678" nor "5678" as a substring, so a parked
+        # French lead was dropped in SQL before the matcher ever saw it - and
+        # 2-digit grouping is the normal spelling across much of Europe, not an
+        # exotic case. Stripping non-digits in SQL is immune to any separator.
+        if target_digits:
             candidate_filters.append(
-                cast(QueuedRunModel.context_variables, String).ilike(f"%{target_digits[-7:]}%")
-            )
-        if len(target_digits) >= 4:
-            candidate_filters.append(
-                cast(QueuedRunModel.context_variables, String).ilike(f"%{target_digits[-4:]}%")
+                func.regexp_replace(
+                    QueuedRunModel.context_variables["phone_number"].as_string(),
+                    "[^0-9]",
+                    "",
+                    "g",
+                )
+                == target_digits
             )
 
         async with self.async_session() as session:
@@ -1022,13 +1112,40 @@ class CampaignClient(BaseDBClient):
         self, queued_run_id: int
     ) -> Optional[QueuedRunModel]:
         """Clears scheduled_for so the run is picked up in the next campaign batch,
-        and removes awaiting_permission disposition on the linked workflow run."""
+        and removes awaiting_permission disposition on the linked workflow run.
+
+        Returns None - changing nothing - if the run is no longer parked on this
+        permission. Meta redelivers permission webhooks, and the same grant can
+        additionally arrive over the messages webhook and the cron sync, so the
+        caller's "still queued and awaiting permission" read is stale by the
+        time we get here. The conditional UPDATE below is the atomic gate: only
+        the writer that observes the row still in ('queued',
+        'awaiting_whatsapp_permission') proceeds, so a duplicate grant cannot
+        un-fail a denied run or re-arm one that has already been claimed.
+        """
         async with self.async_session() as session:
+            gate = await session.execute(
+                update(QueuedRunModel)
+                .where(
+                    QueuedRunModel.id == queued_run_id,
+                    QueuedRunModel.state == "queued",
+                    QueuedRunModel.retry_reason == "awaiting_whatsapp_permission",
+                )
+                .values(scheduled_for=None, retry_reason="permission_granted")
+                .execution_options(synchronize_session=False)
+            )
+            if gate.rowcount == 0:
+                await session.rollback()
+                return None
+
+            # The gate already persisted both fields, and it holds the row lock
+            # until this transaction commits, so this read sees them. Assigning
+            # them again through the ORM would make a second writer for state
+            # the gate alone should own.
             run = await session.get(QueuedRunModel, queued_run_id)
             if not run:
+                await session.rollback()
                 return None
-            run.scheduled_for = None
-            run.retry_reason = "permission_granted"
 
             # Reset awaiting_permission disposition on existing workflow run so UI
             # immediately reverts to the default condition for a live/in-flight run
@@ -1057,22 +1174,62 @@ class CampaignClient(BaseDBClient):
     async def fail_queued_run_permission_denied(
         self, queued_run_id: int
     ) -> Optional[QueuedRunModel]:
-        """Marks a queued run as failed when recipient denies WhatsApp call permission."""
+        """Marks a queued run as failed when recipient denies WhatsApp call permission.
+
+        Returns None - changing nothing - if the run is no longer parked on this
+        permission. The previous "state not in (failed, processed)" check was
+        read from an unlocked row, so two concurrent deliveries of the same
+        denial (Meta retries webhooks, and the messages webhook and cron sync
+        can carry the same event) could both observe 'queued' and each add one
+        to processed_rows/failed_rows. It also could not tell a fresh denial
+        from a stale one for a run that had since been granted and claimed. The
+        conditional UPDATE below is the atomic gate: exactly one writer sees the
+        row in ('queued', 'awaiting_whatsapp_permission') and only that writer
+        touches the campaign counters.
+        """
         async with self.async_session() as session:
-            run = await session.get(QueuedRunModel, queued_run_id)
-            if not run:
+            now = datetime.now(UTC)
+            gate = await session.execute(
+                update(QueuedRunModel)
+                .where(
+                    QueuedRunModel.id == queued_run_id,
+                    QueuedRunModel.state == "queued",
+                    QueuedRunModel.retry_reason == "awaiting_whatsapp_permission",
+                )
+                .values(
+                    state="failed",
+                    retry_reason="permission_denied",
+                    processed_at=now,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if gate.rowcount == 0:
+                await session.rollback()
                 return None
 
-            if run.state not in ("failed", "processed"):
-                if run.campaign_id:
-                    campaign = await session.get(CampaignModel, run.campaign_id)
-                    if campaign:
-                        campaign.processed_rows = (campaign.processed_rows or 0) + 1
-                        campaign.failed_rows = (campaign.failed_rows or 0) + 1
+            run = await session.get(QueuedRunModel, queued_run_id)
+            if not run:
+                await session.rollback()
+                return None
+
+            # The gate proved this run was still parked, so the counters move
+            # exactly once per run. Incrementing SQL-side rather than reading the
+            # campaign and writing back keeps this from clobbering a batch flush
+            # (which increments the same column atomically) that lands in between.
+            if run.campaign_id:
+                await session.execute(
+                    update(CampaignModel)
+                    .where(CampaignModel.id == run.campaign_id)
+                    .values(
+                        processed_rows=func.coalesce(CampaignModel.processed_rows, 0) + 1,
+                        failed_rows=func.coalesce(CampaignModel.failed_rows, 0) + 1,
+                    )
+                    .execution_options(synchronize_session=False)
+                )
 
             run.state = "failed"
             run.retry_reason = "permission_denied"
-            run.processed_at = datetime.now(UTC)
+            run.processed_at = now
             wf_query = (
                 select(WorkflowRunModel)
                 .where(WorkflowRunModel.queued_run_id == queued_run_id)

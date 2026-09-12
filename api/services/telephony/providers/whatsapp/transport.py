@@ -1,25 +1,37 @@
-"""WhatsApp transport factory."""
+"""WhatsApp transport factory — intentionally not a live code path.
 
-from fastapi import WebSocket
-from loguru import logger
-from pipecat.transports.websocket.fastapi import (
-    FastAPIWebsocketParams,
-    FastAPIWebsocketTransport,
-)
+``ProviderSpec.transport_factory`` is required by the registry because every
+other provider works the same way: the carrier dials a Dograh WebSocket and
+``run_pipeline_telephony`` builds a ``FastAPIWebsocketTransport`` around it.
 
-from api.services.pipecat.audio_config import AudioConfig
-from api.services.pipecat.audio_mixer import build_audio_out_mixer
-from api.services.pipecat.transport_params import realtime_param_overrides
-from api.services.telephony.factory import load_credentials_for_transport
+WhatsApp does not work that way. Meta negotiates media as WebRTC, so both call
+directions run ``run_pipeline_smallwebrtc`` over a ``SmallWebRTCConnection``
+handed back by ``pipecat.transports.whatsapp.client`` — see
+``providers/whatsapp/routes.py`` (inbound) and ``providers/whatsapp/service.py``
+``register_outbound_active_connection`` (outbound). Nothing reaches this
+factory.
 
-from .serializers import WhatsAppFrameSerializer
-from .strategies import WhatsAppHangupStrategy, WhatsAppTransferStrategy
+It previously returned a real WebSocket transport wired to a WhatsApp frame
+serializer with its own hangup and transfer strategies. That was a second,
+never-executed implementation of call teardown sitting beside the real one, so
+a fix aimed at teardown could plausibly land here and change nothing. The
+serializer and strategies are gone; this raises instead, so that if the registry
+contract ever does route a WhatsApp call through here it fails loudly rather
+than silently building a transport Meta will never speak to.
+"""
+
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - signature documentation only
+    from fastapi import WebSocket
+
+    from api.services.pipecat.audio_config import AudioConfig
 
 
 async def create_transport(
-    websocket: WebSocket,
+    websocket: "WebSocket",
     workflow_run_id: int,
-    audio_config: AudioConfig,
+    audio_config: "AudioConfig",
     organization_id: int,
     *,
     ambient_noise_config: dict | None = None,
@@ -27,46 +39,11 @@ async def create_transport(
     is_realtime: bool = False,
     call_id: str,
 ):
-    """Create a transport for WhatsApp connections."""
-    config = await load_credentials_for_transport(
-        organization_id, telephony_configuration_id, expected_provider="whatsapp"
-    )
-
-    access_token = config.get("access_token")
-    phone_number_id = config.get("phone_number_id")
-
-    if not access_token or not phone_number_id:
-        raise ValueError(
-            f"Incomplete WhatsApp configuration for organization {organization_id}"
-        )
-
-    serializer = WhatsAppFrameSerializer(
-        call_id=call_id,
-        phone_number_id=phone_number_id,
-        access_token=access_token,
-        transfer_strategy=WhatsAppTransferStrategy(),
-        hangup_strategy=WhatsAppHangupStrategy(),
-        sample_rate=audio_config.transport_in_sample_rate,
-    )
-
-    mixer = await build_audio_out_mixer(
-        audio_config.transport_out_sample_rate, ambient_noise_config
-    )
-
-    logger.info(
-        f"Created WhatsApp transport for call_id={call_id}, "
-        f"workflow_run_id={workflow_run_id}"
-    )
-
-    return FastAPIWebsocketTransport(
-        websocket=websocket,
-        params=FastAPIWebsocketParams(
-            audio_in_enabled=True,
-            audio_out_enabled=True,
-            audio_in_sample_rate=audio_config.transport_in_sample_rate,
-            audio_out_sample_rate=audio_config.transport_out_sample_rate,
-            audio_out_mixer=mixer,
-            serializer=serializer,
-            **realtime_param_overrides(is_realtime),
-        ),
+    """Always raises: WhatsApp media is WebRTC, not a carrier WebSocket."""
+    raise NotImplementedError(
+        "WhatsApp calls do not use a WebSocket transport. Media is negotiated as "
+        "WebRTC and the pipeline runs via run_pipeline_smallwebrtc over the "
+        "SmallWebRTCConnection from the WhatsApp client. Reaching this factory "
+        f"means a WhatsApp call (run {workflow_run_id}, call {call_id}) was "
+        "routed through run_pipeline_telephony, which cannot work."
     )

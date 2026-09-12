@@ -490,6 +490,20 @@ class TelephonyProvider(ABC):
         """
         return ProviderSyncResult(ok=True)
 
+    async def end_call(
+        self, call_id: str, workflow_run_id: int, organization_id: int
+    ) -> bool:
+        """Terminate an in-progress call at the provider.
+
+        The default raises. A provider that cannot be hung up through its API
+        must not let a caller report success while the carrier leg stays
+        connected — the person on the phone is still on the phone. Callers are
+        expected to surface the failure rather than completing the run locally.
+        """
+        raise NotImplementedError(
+            f"{self.PROVIDER_NAME} cannot end a call from the API"
+        )
+
     async def send_call_permission_request(
         self, to_number: str, **kwargs
     ) -> Any:
