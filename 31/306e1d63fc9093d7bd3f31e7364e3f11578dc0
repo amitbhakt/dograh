@@ -1,0 +1,102 @@
+api/services/campaign/campaign_call_dispatcher.py
+  s_b15e8a8ba568e5::t_b3e25937878124 209-211
+  s_b15e8a8ba568e5::t_ad2e3a0b0c67ce 4,68-87,188,381,660
+  s_b15e8a8ba568e5::t_9e2eb46b504d44 387-388,677,719
+api/tests/telephony/whatsapp/test_routes.py
+  s_b15e8a8ba568e5::t_e4e1bca97fbdcf 3
+  s_b15e8a8ba568e5::t_8fe9a115e1a491 54-81,353-375
+api/tests/telephony/whatsapp/test_inbound_call.py
+  s_b15e8a8ba568e5::t_ac39707cade40d 534-539
+ui/src/client/sdk.gen.ts
+  s_b15e8a8ba568e5::t_dfff9b8b0a0452 5,36-66,82,152-156,259-328,1225-1228
+api/tests/telephony/whatsapp/test_campaign_permissions.py
+  s_b15e8a8ba568e5::t_cb48dd37930a6b 1286,1288,1290-1291,1293-1298,1300-1303,1306-1314
+  s_b15e8a8ba568e5::t_fa66e988582dcc 952-953,957-960
+  s_b15e8a8ba568e5::t_35ce95cd2655b2 1373-1374
+  s_b15e8a8ba568e5::t_f8fc1169624810 142,164,166,208,401,415-417,462
+  s_b15e8a8ba568e5::t_abe29b07cd9873 30-51
+  s_b15e8a8ba568e5::t_ac39707cade40d 526,551,561,923-925,927,1062-1063,1287,1292,1299
+  s_b15e8a8ba568e5::t_842f9dbb3e633a 162-163,165,515-517,522-523,525,527-535,537,542-550,552,557-558,560,562-567,572-575,577-578
+  s_b15e8a8ba568e5::t_4b9099b5238d50 485-488,518-521,553-556
+  s_b15e8a8ba568e5::t_c614b323958d66 606-611,613,715-720,760-762,860-862
+  s_b15e8a8ba568e5::t_3d8f51f74c4442 243-245,536,576
+  s_b15e8a8ba568e5::t_3507a70439765c 1032-1039,1076-1089,1390
+  s_b15e8a8ba568e5::t_1a5151be36a978 1186-1190,1215,1410-1412,1414,1419,1421
+ui/src/client/index.ts
+  s_b15e8a8ba568e5::t_5e913d213e165b 4
+  s_b15e8a8ba568e5::t_dfff9b8b0a0452 3
+api/services/telephony/providers/whatsapp/provider.py
+  s_b15e8a8ba568e5::t_5f5e0de640ffdb 33
+  s_b15e8a8ba568e5::t_1a8038a71f984b 315
+api/tests/test_campaign_call_dispatcher.py
+  s_b15e8a8ba568e5::t_53ab2b68041907 30-33,203-205,208
+api/tests/test_from_number_pool_isolation.py
+  s_b15e8a8ba568e5::t_91b3daab357efc 331-333,559-561
+api/services/telephony/providers/whatsapp/config.py
+  s_b15e8a8ba568e5::t_36e4d0c6849da4 46-50,82-98
+api/tests/test_telephony_factory.py
+  s_b15e8a8ba568e5::t_acb70f1d7d07c5 179-185
+api/services/telephony/providers/whatsapp/routes.py
+  s_b15e8a8ba568e5::t_b8350b52f3a0a0 57
+  s_b15e8a8ba568e5::t_62d851f230a193 1292
+  s_b15e8a8ba568e5::t_311bed21ae9beb 85,87,89-90
+  s_b15e8a8ba568e5::t_089393545213a9 45-46,86,88,121
+  s_b15e8a8ba568e5::t_81fdcbd0337960 125-140,991,995-996,1094-1117
+api/services/turn.py
+  s_b15e8a8ba568e5::t_b0d06f04d2df8b 1-107
+api/services/telephony/providers/whatsapp/permission_sync.py
+  s_b15e8a8ba568e5::t_3ae0adcab36998 97-110,117,155-161,163-179
+  s_b15e8a8ba568e5::t_62d851f230a193 33-34,73,90,92,125,183,306,318,343,366
+  s_b15e8a8ba568e5::t_32421976bafd20 1-32,35-72,74-89,91,93-96,111-116,118-124,126-154,162,180-182,184-305,307-317,319-342,344-365,367-385
+api/db/campaign_client.py
+  s_b15e8a8ba568e5::t_a0b9b3a56e6d1f 1228-1232
+  s_b15e8a8ba568e5::t_6cfc59dceb6d2c 1259-1271
+  s_b15e8a8ba568e5::t_497054daf84c9a 6,1304-1318
+  s_b15e8a8ba568e5::t_d6dc119f140ab6 608-622,625-632
+api/tests/test_telephony_routes.py
+  s_b15e8a8ba568e5::t_91b3daab357efc 68-69,71
+api/tasks/campaign_tasks.py
+  s_b15e8a8ba568e5::t_311bed21ae9beb 257
+ui/src/client/types.gen.ts
+  s_b15e8a8ba568e5::t_dfff9b8b0a0452 1115-1117,1561-1564,2694-2731,6082-6083,6093-6095,6250-6251,6261-6263,6951-6954,7451,7482-7615,8436-8519,8541-8561,8732-8763,9073-9076,9078,9080,9082,9084-9088,9090-9172,9174-9216,9218-9384,12976-13018
+  s_b15e8a8ba568e5::t_5e913d213e165b 7452-7481,9173,9217
+api/routes/public_embed.py
+  s_b15e8a8ba568e5::t_089393545213a9 26-28
+api/routes/organization.py
+  s_b15e8a8ba568e5::t_d0d65b7f68f9e2 1646-1657
+api/db/telephony_configuration_client.py
+  s_b15e8a8ba568e5::t_1a8038a71f984b 443-451,462-470
+api/routes/webrtc_signaling.py
+  s_b15e8a8ba568e5::t_089393545213a9 42-43
+api/services/telephony/providers/whatsapp/service.py
+  s_b15e8a8ba568e5::t_7fcd93a5b2ab90 515-516
+  s_b15e8a8ba568e5::t_accd3136d495ba 59-91,102-148,517-519,595-597
+  s_b15e8a8ba568e5::t_089393545213a9 9,12-17,37-42,248-252,609-610,738,849
+  s_b15e8a8ba568e5::t_10295ff2740879 149-167,593-594
+api/tests/telephony/whatsapp/test_termination.py
+  s_b15e8a8ba568e5::t_6cbe59a8dee294 92-164
+  s_b15e8a8ba568e5::t_70b7f465a74286 24,30,86-88
+  s_b15e8a8ba568e5::t_768018c51c4dd9 1-23,25-29,31-85,89-91,165-191
+ui/src/app/campaigns/[campaignId]/page.tsx
+  s_b15e8a8ba568e5::t_83a9826e0fca60 18,111-112,117,136-137,252-253,260-261,263-268,274
+  s_b15e8a8ba568e5::t_e0e19d97850310 13
+api/routes/turn_credentials.py
+  s_b15e8a8ba568e5::t_9a5e634c8b2663 22
+  s_b15e8a8ba568e5::t_b0d06f04d2df8b 25
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "31306e1d63fc9093d7bd3f31e7364e3f11578dc0",
+  "prompts": {},
+  "sessions": {
+    "s_b15e8a8ba568e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4942cbf1-f1cf-470f-882d-692f09328558",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Amit Bhakt <yashubhakt@gmail.com>"
+    }
+  }
+}
