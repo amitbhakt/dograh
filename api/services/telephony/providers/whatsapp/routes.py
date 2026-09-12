@@ -42,12 +42,8 @@ from api.db.models import (
     WorkflowRunModel,
 )
 from api.enums import CallType, TelephonyCallStatus, WorkflowRunState
-from api.routes.turn_credentials import (
-    TURN_HOST,
-    TURN_PORT,
-    TURN_SECRET,
-    generate_turn_credentials,
-)
+from api.constants import TURN_HOST, TURN_PORT, TURN_SECRET
+from api.services.turn import generate_turn_credentials
 from api.services.auth.depends import get_user
 from api.services.call_concurrency import (
     CallConcurrencyLimitError,
@@ -58,6 +54,7 @@ from api.services.quota_service import authorize_workflow_run_start
 from api.services.telephony.providers.whatsapp.config import (
     DEFAULT_WHATSAPP_PERMISSION_MESSAGE,
     GRANTED_PERMISSION_STATUSES,
+    is_revoked_permission_status,
     normalize_whatsapp_permission_status,
     parse_whatsapp_expiration,
 )
@@ -85,6 +82,12 @@ router = APIRouter(prefix="/whatsapp")
 # glue only (see providers/AGENTS.md).
 unprefixed_router = APIRouter()
 
+from api.services.telephony.providers.whatsapp.permission_sync import (
+    WhatsAppPermissionSyncResult,
+    reactivate_campaign_runs_for_recipient,
+    sync_all_parked_whatsapp_permissions,
+    sync_whatsapp_permissions_for_campaign,
+)
 from api.services.telephony.providers.whatsapp.service import (
     REDIS_CALL_EVENTS_CHANNEL,
     REDIS_PERMISSION_CHANNEL,
@@ -98,12 +101,13 @@ from api.services.telephony.providers.whatsapp.service import (
     _get_http_session,
     _get_or_create_whatsapp_client,
     _get_redis,
+    _handle_call_terminate,
     _http_session,
     _listen_for_remote_events,
     _outbound_answered_events,
-    unregister_outbound_active_connection,
     _redis_client,
     _redis_subscriber_task,
+    _run_whatsapp_pipeline,
     build_whatsapp_ice_servers,
     ensure_redis_subscriber,
     get_http_session,
@@ -114,8 +118,24 @@ from api.services.telephony.providers.whatsapp.service import (
     register_outbound_active_connection,
     set_pipeline_runner,
     terminate_whatsapp_call_by_id,
-    _handle_call_terminate,
+    unregister_outbound_active_connection,
 )
+
+
+class WhatsAppCampaignPermissionSyncResponse(BaseModel):
+    """Response payload for POST /whatsapp/campaigns/{id}/sync-permissions.
+
+    Declared rather than returned as a bare dict so the shape reaches the
+    generated TypeScript client: ``throttled`` is the difference between "the
+    cooldown skipped this run" and "Meta says nobody has granted yet", and a
+    caller that has to guess at an untyped body is how that distinction gets
+    dropped.
+    """
+
+    success: bool
+    campaign_id: int
+    reactivated_count: int
+    throttled: bool
 
 
 class WhatsAppPermissionCheckResponse(BaseModel):
@@ -859,80 +879,6 @@ async def _handle_inbound_call_connect(
         await _reject_whatsapp_call(phone_number_id, call_id, access_token)
 
 
-async def _run_whatsapp_pipeline(
-    connection: SmallWebRTCConnection,
-    workflow_id: int,
-    workflow_run_id: int,
-    user_id: int,
-    organization_id: int,
-    call_id: str,
-    call_answered_event: Optional["OutboundCallGate"] = None,
-) -> None:
-    """Execute Dograh's WebRTC AI pipeline over the active peer connection."""
-    try:
-        logger.info(
-            f"[WhatsApp] Pipeline started for workflow_run {workflow_run_id}, call_id={call_id}"
-        )
-        await run_pipeline_smallwebrtc(
-            webrtc_connection=connection,
-            workflow_id=workflow_id,
-            workflow_run_id=workflow_run_id,
-            user_id=user_id,
-            organization_id=organization_id,
-            call_answered_event=call_answered_event,
-        )
-        logger.info(
-            f"[WhatsApp] Pipeline finished cleanly for workflow_run {workflow_run_id}"
-        )
-    except Exception as e:
-        logger.error(
-            f"[WhatsApp] Pipeline error for workflow_run {workflow_run_id}: {e}",
-            exc_info=True,
-        )
-        try:
-            await mark_workflow_run_failed(
-                workflow_run_id, str(e), only_if_incomplete=True
-            )
-        except Exception as mark_err:
-            logger.warning(
-                f"[WhatsApp] Failed to mark workflow run {workflow_run_id} failed: {mark_err}"
-            )
-    finally:
-        answered_evt = _outbound_answered_events.pop(call_id, None)
-        if answered_evt:
-            answered_evt.resolve(TERMINATED)
-        provider_terminated = False
-        try:
-            provider_terminated = await terminate_whatsapp_call_by_id(
-                call_id=call_id,
-                workflow_run_id=workflow_run_id,
-                organization_id=organization_id,
-            )
-        except Exception as term_err:
-            logger.warning(
-                f"[WhatsApp] Failed to send terminate in pipeline cleanup for call {call_id}: {term_err}"
-            )
-        _active_connections.pop(call_id, None)
-        # Only clear the Redis recovery key once Meta has actually confirmed the
-        # hangup. terminate_whatsapp_call_by_id -> _handle_call_terminate already
-        # leaves the key in place when termination is unconfirmed so a retry can
-        # recover phone_number_id/organization_id for call_id; an unconditional
-        # delete here would undo that preservation immediately afterwards.
-        if provider_terminated:
-            try:
-                redis = await _get_redis()
-                if redis:
-                    await redis.delete(f"{WHATSAPP_CALL_KEY_PREFIX}{call_id}")
-            except Exception:
-                pass
-        try:
-            await call_concurrency.release_workflow_run_slot(workflow_run_id)
-        except Exception as e:
-            logger.warning(
-                f"[WhatsApp] Failed to release concurrency slot for workflow_run {workflow_run_id}: {e}"
-            )
-
-
 async def _handle_outbound_sdp_answer(
     call_data: Dict[str, Any], payload: Dict[str, Any]
 ) -> None:
@@ -1042,19 +988,12 @@ async def _handle_call_accepted(
         logger.warning(f"[WhatsApp] Failed publishing call accepted event: {e}")
 
 
-# Register the WhatsApp pipeline runner with the service layer
+# Register the WhatsApp pipeline runner with the service layer (kept for backward compatibility)
 def install_whatsapp_pipeline_runner() -> None:
     """Wire the WhatsApp voice pipeline runner into the service layer.
 
-    Called explicitly from each composition root that can place or receive a
-    WhatsApp call: the FastAPI app's lifespan and the ARQ worker's on_startup.
-
-    Deliberately NOT invoked at module scope. Registering as an import side
-    effect is what made pipeline availability depend on whether something had
-    happened to import this module yet - the ARQ worker only did so via a cron,
-    so a campaign call dispatched before that cron ran registered with no
-    pipeline behind it. Keeping the side effect alongside the explicit calls
-    would leave that original coupling in place while looking fixed.
+    Deprecated: Provider registration is now import-driven when the package is
+    imported, without requiring explicit calls from app lifespan or workers.
     """
     set_pipeline_runner(_run_whatsapp_pipeline)
 
@@ -1152,293 +1091,30 @@ async def _handle_user_call_permissions_change(
         )
 
 
-async def reactivate_campaign_runs_for_recipient(
-    phone_number: str,
-    status: str,
-    phone_number_id: Optional[str] = None,
-    telephony_configuration_id: Optional[int] = None,
-    campaign_id: Optional[int] = None,
-) -> int:
-    """Reactivate parked campaign runs when a recipient grants call permission, or fail them if denied."""
-    if not phone_number:
-        return 0
+@router.post(
+    "/campaigns/{campaign_id}/sync-permissions",
+    response_model=WhatsAppCampaignPermissionSyncResponse,
+)
+@router.post(
+    "/campaigns/{campaign_id}/sync-whatsapp-permissions",
+    response_model=WhatsAppCampaignPermissionSyncResponse,
+)
+async def sync_campaign_whatsapp_permissions(
+    campaign_id: int,
+    user: UserModel = Depends(get_user),
+) -> WhatsAppCampaignPermissionSyncResponse:
+    """Manually trigger WhatsApp call permission sync with Meta for parked leads in this campaign."""
+    campaign = await db_client.get_campaign(campaign_id, user.selected_organization_id)
+    if not campaign:
+        raise HTTPException(status_code=404, detail="Campaign not found")
 
-    clean_phone = phone_number.strip().lstrip("+")
-    try:
-        from api.tasks.arq import enqueue_job
-        from api.tasks.function_names import FunctionNames
-
-        # Resolve target configuration id if phone_number_id is supplied.
-        #
-        # get_queued_runs_awaiting_whatsapp_permission searches parked runs
-        # across every organization - the recipient number is the only key it
-        # has - so target_config_id is the ONLY tenant boundary on the filter
-        # below. Letting an unresolved id fall through to "no filter" would let
-        # one business's grant or denial activate or fail another business's
-        # campaign run for the same recipient. Resolution can legitimately fail:
-        # the configuration may have been deactivated since the webhook was
-        # verified, or the id may resolve ambiguously (that lookup refuses to
-        # guess). Refuse rather than run unscoped.
-        target_config_id = telephony_configuration_id
-        if target_config_id is None and phone_number_id:
-            cfg = await db_client.get_whatsapp_configuration_by_phone_number_id(phone_number_id)
-            if not cfg:
-                logger.error(
-                    f"[WhatsApp] Cannot resolve a telephony configuration for "
-                    f"phone_number_id={phone_number_id!r}; refusing to touch parked "
-                    f"runs for {clean_phone} without a tenant boundary."
-                )
-                return 0
-            target_config_id = cfg.id
-
-        if target_config_id is None and campaign_id is None:
-            logger.error(
-                f"[WhatsApp] Refusing to reactivate parked runs for {clean_phone}: "
-                "neither a telephony configuration nor a campaign scopes this request."
-            )
-            return 0
-
-        waiting_runs = await db_client.get_queued_runs_awaiting_whatsapp_permission(clean_phone)
-        if not waiting_runs:
-            waiting_runs = await db_client.get_queued_runs_awaiting_whatsapp_permission("+" + clean_phone)
-
-        if not waiting_runs:
-            return 0
-
-        # Filter waiting runs by campaign_id or telephony_configuration_id if provided
-        filtered_runs = []
-        for q_run in waiting_runs:
-            if campaign_id is not None and q_run.campaign_id != campaign_id:
-                continue
-            if target_config_id is not None:
-                camp = await db_client.get_campaign_by_id(q_run.campaign_id)
-                if not camp or camp.telephony_configuration_id != target_config_id:
-                    continue
-            filtered_runs.append(q_run)
-
-        if not filtered_runs:
-            return 0
-
-        if status in ("granted", "temporary", "permanent", "granted_temporary", "granted_permanent"):
-            logger.info(
-                f"[WhatsApp] Found {len(filtered_runs)} queued run(s) awaiting permission for {clean_phone}. "
-                "Activating for immediate dialing."
-            )
-            triggered_campaign_ids = set()
-            for q_run in filtered_runs:
-                await db_client.activate_queued_run_for_immediate_dial(q_run.id)
-                triggered_campaign_ids.add(q_run.campaign_id)
-
-            for camp_id in triggered_campaign_ids:
-                campaign = await db_client.get_campaign_by_id(camp_id)
-                if campaign and campaign.state == "running":
-                    await enqueue_job(
-                        FunctionNames.PROCESS_CAMPAIGN_BATCH,
-                        camp_id,
-                        10,
-                    )
-                    logger.info(
-                        f"[WhatsApp] Enqueued immediate batch for campaign {camp_id} "
-                        f"after recipient {clean_phone} granted call permission."
-                    )
-            return len(filtered_runs)
-
-        elif status in ("denied", "revoked"):
-            for q_run in filtered_runs:
-                await db_client.fail_queued_run_permission_denied(q_run.id)
-                logger.info(
-                    f"[WhatsApp] Marked queued run {q_run.id} as failed (permission_denied) "
-                    f"for recipient {clean_phone}."
-                )
-            return len(filtered_runs)
-    except Exception as e:
-        logger.warning(
-            f"[WhatsApp] Error reactivating queued runs on permission change for {clean_phone}: {e}"
-        )
-    return 0
-
-
-@dataclass(frozen=True)
-class WhatsAppPermissionSyncResult:
-    """Outcome of a permission sync.
-
-    ``throttled`` distinguishes "the cooldown skipped this run" from "we asked
-    Meta and nobody had granted permission". Both reactivate zero runs, and a
-    caller that only sees the count reports the second when it means the first.
-    """
-
-    reactivated: int = 0
-    throttled: bool = False
-
-
-async def sync_whatsapp_permissions_for_campaign(
-    campaign_id: int, force: bool = False
-) -> WhatsAppPermissionSyncResult:
-    """
-    Syncs WhatsApp call permission status from Meta Graph API for any leads parked
-    in awaiting_whatsapp_permission for this campaign.
-
-    If permission has been granted, activates the queued run for immediate dialing.
-    If force is False, enforces a 30s cooldown per campaign via Redis to avoid
-    spamming Meta - each sync costs one Graph call per parked recipient.
-
-    The cooldown lives here and only here. Claiming it is the check: SET NX is
-    atomic, so two concurrent callers cannot both decide they are first, which a
-    separate read-then-write could. Callers must not reconstruct the key.
-    """
-    if not campaign_id:
-        return WhatsAppPermissionSyncResult()
-
-    try:
-        parked_runs = await db_client.get_all_queued_runs_awaiting_whatsapp_permission(
-            campaign_id=campaign_id
-        )
-        if not parked_runs:
-            return WhatsAppPermissionSyncResult()
-
-        campaign = await db_client.get_campaign_by_id(campaign_id)
-        if not campaign or campaign.state != "running":
-            return WhatsAppPermissionSyncResult()
-
-        if not campaign.telephony_configuration_id:
-            return WhatsAppPermissionSyncResult()
-
-        config = await db_client.get_telephony_configuration(
-            campaign.telephony_configuration_id
-        )
-        if not config or config.provider != "whatsapp":
-            return WhatsAppPermissionSyncResult()
-
-        creds = config.credentials or {}
-        phone_number_id = creds.get("phone_number_id")
-        access_token = creds.get("access_token")
-        if not phone_number_id or not access_token:
-            return WhatsAppPermissionSyncResult()
-
-        recipients = set()
-        for r in parked_runs:
-            pn = str((r.context_variables or {}).get("phone_number") or "").strip()
-            if pn:
-                recipients.add(pn)
-
-        if not recipients:
-            return WhatsAppPermissionSyncResult()
-
-        client = _get_or_create_whatsapp_client(
-            phone_number_id=phone_number_id,
-            access_token=access_token,
-            app_secret=creds.get("app_secret"),
-        )
-
-        redis_client = await _get_redis()
-        cooldown_key = f"wa_perm_sync_cooldown:{campaign_id}"
-        if not force and redis_client:
-            try:
-                claimed = await redis_client.set(cooldown_key, "1", nx=True, ex=30)
-                if not claimed:
-                    return WhatsAppPermissionSyncResult(throttled=True)
-            except Exception:
-                pass
-        elif force and redis_client:
-            try:
-                await redis_client.set(cooldown_key, "1", ex=30)
-            except Exception:
-                pass
-
-        reactivated_total = 0
-        now = datetime.now(UTC)
-
-        for recipient in recipients:
-            clean_recipient = recipient.lstrip("+")
-            try:
-                meta_res = await client.check_call_permission(clean_recipient)
-                if not meta_res or "error" in meta_res:
-                    continue
-
-                meta_perm = meta_res.get("permission") or {}
-                meta_status = meta_perm.get("status") or meta_res.get("status")
-                can_start_call = False
-                for act in meta_res.get("actions") or []:
-                    if act.get("action_name") == "start_call" and act.get("can_perform_action", False):
-                        can_start_call = True
-
-                normalized_status = normalize_whatsapp_permission_status(meta_status)
-
-                if can_start_call or normalized_status in GRANTED_PERMISSION_STATUSES:
-                    actual_status = (
-                        normalized_status
-                        if normalized_status in GRANTED_PERMISSION_STATUSES
-                        else "granted_temporary"
-                    )
-                    perm_type = (
-                        "permanent" if actual_status == "granted_permanent" else "temporary"
-                    )
-                    # Persist Meta's expiry: a temporary grant stored without one
-                    # would later read as a permission that never lapses.
-                    meta_expires_at = parse_whatsapp_expiration(
-                        meta_perm.get("expiration_time") or meta_res.get("expiration")
-                    )
-                    await db_client.upsert_whatsapp_call_permission(
-                        organization_id=config.organization_id,
-                        telephony_configuration_id=config.id,
-                        phone_number_id=phone_number_id,
-                        recipient_phone_number=recipient,
-                        status=actual_status,
-                        permission_type=perm_type,
-                        expires_at=meta_expires_at,
-                        granted_at=now,
-                    )
-                    count = await reactivate_campaign_runs_for_recipient(
-                        recipient,
-                        actual_status,
-                        phone_number_id=phone_number_id,
-                        telephony_configuration_id=config.id,
-                        campaign_id=campaign_id,
-                    )
-                    reactivated_total += count
-                elif normalized_status in ("denied", "revoked"):
-                    await db_client.upsert_whatsapp_call_permission(
-                        organization_id=config.organization_id,
-                        telephony_configuration_id=config.id,
-                        phone_number_id=phone_number_id,
-                        recipient_phone_number=recipient,
-                        status=normalized_status,
-                        expires_at=None,
-                    )
-                    await reactivate_campaign_runs_for_recipient(
-                        recipient,
-                        normalized_status,
-                        phone_number_id=phone_number_id,
-                        telephony_configuration_id=config.id,
-                        campaign_id=campaign_id,
-                    )
-            except Exception as e:
-                logger.warning(
-                    f"[WhatsApp] Failed checking call permission for {recipient} in campaign {campaign_id}: {e}"
-                )
-
-        return WhatsAppPermissionSyncResult(reactivated=reactivated_total)
-    except Exception as e:
-        logger.warning(f"[WhatsApp] Error in sync_whatsapp_permissions_for_campaign: {e}")
-        return WhatsAppPermissionSyncResult()
-
-
-async def sync_all_parked_whatsapp_permissions() -> int:
-    """Check and sync WhatsApp call permissions across all running campaigns with parked runs."""
-    try:
-        parked = await db_client.get_all_queued_runs_awaiting_whatsapp_permission()
-        if not parked:
-            return 0
-        campaign_ids = {r.campaign_id for r in parked}
-        total = 0
-        for cid in campaign_ids:
-            total += (
-                await sync_whatsapp_permissions_for_campaign(cid, force=False)
-            ).reactivated
-        return total
-    except Exception as e:
-        logger.warning(f"[WhatsApp] Error in sync_all_parked_whatsapp_permissions: {e}")
-        return 0
+    result = await sync_whatsapp_permissions_for_campaign(campaign_id, force=False)
+    return WhatsAppCampaignPermissionSyncResponse(
+        success=True,
+        campaign_id=campaign_id,
+        reactivated_count=result.reactivated,
+        throttled=result.throttled,
+    )
 
 
 @router.get("/permissions/check", response_model=WhatsAppPermissionCheckResponse)
@@ -1613,7 +1289,7 @@ async def check_whatsapp_permission(
                         status=normalized_st,
                         expires_at=None,
                     )
-                    if normalized_st in ("revoked", "denied"):
+                    if is_revoked_permission_status(normalized_st):
                         await reactivate_campaign_runs_for_recipient(
                             recipient,
                             normalized_st,

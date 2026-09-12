@@ -6,8 +6,15 @@ from HTTP router handlers.
 """
 
 import asyncio
+from dataclasses import dataclass
 import json
 from datetime import datetime, timezone
+
+try:
+    from datetime import UTC
+except ImportError:
+    UTC = timezone.utc
+
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import aiohttp
@@ -27,6 +34,12 @@ from api.enums import WorkflowRunState
 from api.services.call_concurrency import call_concurrency
 from api.services.pipecat.call_gate import ANSWERED, TERMINATED, OutboundCallGate
 from api.services.turn import generate_turn_credentials
+from api.services.workflow_run_failure import mark_workflow_run_failed
+from api.services.telephony.providers.whatsapp.config import (
+    GRANTED_PERMISSION_STATUSES,
+    normalize_whatsapp_permission_status,
+    parse_whatsapp_expiration,
+)
 from pipecat.transports.smallwebrtc.connection import IceServer, SmallWebRTCConnection
 from pipecat.transports.whatsapp.client import WhatsAppClient
 
@@ -43,6 +56,39 @@ _outbound_answered_events: Dict[str, OutboundCallGate] = {}
 # call_id -> its pipeline task, so a rollback can cancel exactly the right one
 # instead of diffing the background-task set from outside this module.
 _pipeline_tasks: Dict[str, asyncio.Task] = {}
+# call_id -> the pipeline task some other teardown has cancelled and taken
+# ownership of. That task's finalizer ends the call too - it runs
+# terminate_whatsapp_call_by_id, which re-enters handle_call_terminate - so
+# without this a termination starting outside the pipeline (Meta webhook,
+# cross-worker publish, provider end_call, outbound rollback) makes the
+# pipeline it just cancelled issue a second Graph API terminate, a second
+# terminate publish and a second completion write for the same call.
+#
+# Keyed by the task, and cleared by that task's own done callback, because the
+# canceller's wait is bounded: a pipeline that ignores cancellation for longer
+# than the timeout is abandoned, runs its finalizer later, and must still be
+# suppressed then. Tying the entry to the task's lifetime rather than to how
+# long anyone waited is what makes that case safe, and it still lets a genuine
+# later termination of the same call through - by then the task is done and
+# the entry is gone.
+_pipeline_teardown_claims: Dict[str, asyncio.Task] = {}
+
+
+def _claim_pipeline_teardown(call_id: str, task: asyncio.Task) -> None:
+    """Take ownership of ``task``'s teardown before cancelling it."""
+    _pipeline_teardown_claims[call_id] = task
+    task.add_done_callback(
+        lambda finished, cid=call_id: (
+            _pipeline_teardown_claims.pop(cid, None)
+            if _pipeline_teardown_claims.get(cid) is finished
+            else None
+        )
+    )
+
+
+def _teardown_claimed_by_other(call_id: str) -> bool:
+    """True when the current task is a pipeline whose teardown someone else owns."""
+    return _pipeline_teardown_claims.get(call_id) is asyncio.current_task()
 _background_tasks: Set[asyncio.Task] = set()
 
 # Reusable aiohttp session and cached clients per phone_number_id
@@ -53,8 +99,95 @@ _clients: Dict[str, WhatsAppClient] = {}
 _redis_client: Optional[aioredis.Redis] = None
 _redis_subscriber_task: Optional[asyncio.Task] = None
 
-# Pipeline runner hook set by routes or runner runtime
-_pipeline_runner: Optional[Callable[..., Any]] = None
+async def _run_whatsapp_pipeline(
+    connection: SmallWebRTCConnection,
+    workflow_id: int,
+    workflow_run_id: int,
+    user_id: int,
+    organization_id: int,
+    call_id: str,
+    call_answered_event: Optional["OutboundCallGate"] = None,
+) -> None:
+    try:
+        from api.services.pipecat.run_pipeline import run_pipeline_smallwebrtc
+
+        logger.info(
+            f"[WhatsApp] Pipeline started for workflow_run {workflow_run_id}, call_id={call_id}"
+        )
+        await run_pipeline_smallwebrtc(
+            webrtc_connection=connection,
+            workflow_id=workflow_id,
+            workflow_run_id=workflow_run_id,
+            user_id=user_id,
+            organization_id=organization_id,
+            call_answered_event=call_answered_event,
+        )
+        logger.info(
+            f"[WhatsApp] Pipeline finished cleanly for workflow_run {workflow_run_id}"
+        )
+    except Exception as e:
+        logger.error(
+            f"[WhatsApp] Pipeline error for workflow_run {workflow_run_id}: {e}",
+            exc_info=True,
+        )
+        try:
+            await mark_workflow_run_failed(
+                workflow_run_id, str(e), only_if_incomplete=True
+            )
+        except Exception as mark_err:
+            logger.warning(
+                f"[WhatsApp] Failed to mark workflow run {workflow_run_id} failed: {mark_err}"
+            )
+    finally:
+        answered_evt = _outbound_answered_events.pop(call_id, None)
+        if answered_evt:
+            answered_evt.resolve(TERMINATED)
+        provider_terminated = False
+        # Cleared by this task's done callback, not here: reading it must not
+        # depend on finishing before whoever cancelled us gave up waiting.
+        if _teardown_claimed_by_other(call_id):
+            # handle_call_terminate cancelled this task and owns the rest of
+            # the teardown - Meta terminate, peer disconnect, run completion.
+            # Re-entering it from here would duplicate all three for a call
+            # that is already being torn down.
+            logger.debug(
+                f"[WhatsApp] Pipeline cleanup for call {call_id} skipping terminate; "
+                "termination already in progress"
+            )
+        else:
+            try:
+                provider_terminated = await terminate_whatsapp_call_by_id(
+                    call_id=call_id,
+                    workflow_run_id=workflow_run_id,
+                    organization_id=organization_id,
+                )
+            except Exception as term_err:
+                logger.warning(
+                    f"[WhatsApp] Failed to send terminate in pipeline cleanup for call {call_id}: {term_err}"
+                )
+        _active_connections.pop(call_id, None)
+        # Only clear the Redis recovery key once Meta has actually confirmed the
+        # hangup. terminate_whatsapp_call_by_id -> _handle_call_terminate already
+        # leaves the key in place when termination is unconfirmed so a retry can
+        # recover phone_number_id/organization_id for call_id; an unconditional
+        # delete here would undo that preservation immediately afterwards.
+        if provider_terminated:
+            try:
+                redis = await _get_redis()
+                if redis:
+                    await redis.delete(f"{WHATSAPP_CALL_KEY_PREFIX}{call_id}")
+            except Exception:
+                pass
+        try:
+            await call_concurrency.release_workflow_run_slot(workflow_run_id)
+        except Exception as e:
+            logger.warning(
+                f"[WhatsApp] Failed to release concurrency slot for workflow_run {workflow_run_id}: {e}"
+            )
+
+
+# Pipeline runner hook defaulted to the WhatsApp voice pipeline runner
+_pipeline_runner: Optional[Callable[..., Any]] = _run_whatsapp_pipeline
 
 
 def set_pipeline_runner(runner: Callable[..., Any]) -> None:
@@ -69,14 +202,7 @@ def get_pipeline_runner() -> Optional[Callable[..., Any]]:
 
 
 def resolve_pipeline_runner() -> Optional[Callable[..., Any]]:
-    """Retrieve the pipeline runner wired at process startup.
-
-    Deliberately does no importing of its own. Reaching up into the routes
-    module from here to trigger its registration side effect made the service
-    layer depend on an HTTP module, and made whether an outbound call gets a
-    voice pipeline depend on import timing. Every process that can place a call
-    wires this explicitly instead - see ``install_whatsapp_pipeline_runner``.
-    """
+    """Retrieve the registered voice pipeline runner callable."""
     return _pipeline_runner
 
 
@@ -119,7 +245,11 @@ def build_whatsapp_ice_servers() -> List[IceServer]:
         servers.append(IceServer(urls="stun:stun.l.google.com:19302"))
 
     if ENABLE_COTURN and TURN_HOST and TURN_SECRET:
-        creds = generate_turn_credentials("whatsapp", TURN_SECRET)
+        # Second argument is the TTL, not the secret - the generator reads
+        # TURN_SECRET from constants and adds this to the current time. Passing
+        # the secret here made that an int + str and raised on every ICE build
+        # with coturn enabled.
+        creds = generate_turn_credentials("whatsapp")
         turn_udp = f"turn:{TURN_HOST}:{TURN_PORT}?transport=udp"
         turn_tcp = f"turn:{TURN_HOST}:{TURN_PORT}?transport=tcp"
         servers.append(
@@ -382,6 +512,11 @@ async def unregister_outbound_active_connection(
     if task is None or task.done():
         return
 
+    # Same claim handle_call_terminate uses: the caller rolling this call back
+    # hangs it up at Meta itself, so the cancelled pipeline's finalizer must not
+    # issue its own terminate for the same call - including when it gets there
+    # after the bounded wait below has given up.
+    _claim_pipeline_teardown(call_id, task)
     task.cancel()
     try:
         # Bounded: a pipeline that swallows cancellation must not hang the
@@ -450,6 +585,28 @@ async def handle_call_terminate(
     answered_evt = _outbound_answered_events.pop(call_id, None)
     if answered_evt:
         answered_evt.resolve(TERMINATED)
+
+    task = _pipeline_tasks.pop(call_id, None)
+    if task is not None and not task.done():
+        current = asyncio.current_task()
+        if current is not task:
+            # Claimed before the cancellation so the task's finalizer, which
+            # runs terminate_whatsapp_call_by_id, sees that this teardown owns
+            # the call and does not re-enter this function. The claim outlives
+            # the wait below - see _claim_pipeline_teardown.
+            _claim_pipeline_teardown(call_id, task)
+            task.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(task), timeout=5.0)
+            except asyncio.CancelledError:
+                pass
+            except asyncio.TimeoutError:
+                logger.warning(
+                    f"[WhatsApp] Pipeline task for {call_id} did not stop within 5.0s "
+                    "after cancellation; abandoning it."
+                )
+            except Exception as e:
+                logger.warning(f"[WhatsApp] Pipeline task for {call_id} errored during teardown: {e}")
 
     entry = _active_connections.pop(call_id, None)
     if entry:
@@ -578,7 +735,7 @@ async def terminate_whatsapp_call_by_id(
             configs = await db_client.list_telephony_configurations_by_provider(
                 organization_id, "whatsapp"
             )
-            config = configs[0] if configs else None
+            config = configs[0] if len(configs) == 1 else None
 
         if config:
             creds = config.credentials or {}
@@ -689,3 +846,4 @@ def resolve_live_call_state(call_id, workflow_run_id):
         peer_connected=peer_connected,
         answered=getattr(connection, "call_status", None) == "in-progress",
     )
+

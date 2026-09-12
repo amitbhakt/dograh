@@ -43,6 +43,11 @@ def parse_whatsapp_expiration(expiration: Any) -> Optional[datetime]:
 # Canonical permission states persisted in whatsapp_call_permissions.status.
 GRANTED_PERMISSION_STATUSES = frozenset({"granted_temporary", "granted_permanent"})
 
+# Consent that was refused or taken back. Distinct from "no_permission", which
+# means the recipient has simply not answered yet: these fail a parked campaign
+# run outright, that one leaves it parked.
+REVOKED_PERMISSION_STATUSES = frozenset({"denied", "revoked"})
+
 # Meta reports permission state under several spellings depending on whether it
 # comes from the Graph API permission object or a user_call_permissions webhook.
 # Map every accepted alias onto the canonical state we store. Anything missing
@@ -72,6 +77,23 @@ def normalize_whatsapp_permission_status(status: Any) -> Optional[str]:
     if not isinstance(status, str):
         return None
     return _PERMISSION_STATUS_ALIASES.get(status.strip().lower())
+
+
+def is_granted_permission_status(status: Any) -> bool:
+    """Whether ``status`` means the recipient has consented to being called.
+
+    Takes a raw Meta status or an already-canonical one - it normalises first,
+    so callers do not each keep their own list of the spellings Meta uses
+    ("granted", "temporary", "permanent", ...). Adding or renaming a Meta
+    status is then one edit to the alias map above, not a hunt through every
+    webhook and polling path for a hardcoded tuple.
+    """
+    return normalize_whatsapp_permission_status(status) in GRANTED_PERMISSION_STATUSES
+
+
+def is_revoked_permission_status(status: Any) -> bool:
+    """Whether ``status`` means consent was refused or withdrawn."""
+    return normalize_whatsapp_permission_status(status) in REVOKED_PERMISSION_STATUSES
 
 
 class WhatsAppConfigurationRequest(BaseModel):

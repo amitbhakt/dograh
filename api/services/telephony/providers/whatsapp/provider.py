@@ -30,6 +30,7 @@ from api.enums import TelephonyCallStatus, WorkflowRunMode
 from api.services.telephony import ws_auth
 from api.services.telephony.providers.whatsapp.config import (
     DEFAULT_WHATSAPP_PERMISSION_MESSAGE,
+    is_granted_permission_status,
     normalize_whatsapp_permission_status,
     parse_whatsapp_expiration,
 )
@@ -52,7 +53,6 @@ def _local_permission_is_usable(perm: Any, now: datetime) -> bool:
         return bool(perm.expires_at) and now <= perm.expires_at
     return False
 from api.services.telephony.base import (
-    AnsweringMachineDetectionResult,
     CallInitiationResult,
     NormalizedInboundData,
     ProviderPhoneNumberLookupError,
@@ -67,7 +67,7 @@ if TYPE_CHECKING:
     from fastapi import WebSocket
 
 
-class WhatsAppPermissionRequiredError(TelephonyPermissionRequiredError, HTTPException):
+class WhatsAppPermissionRequiredError(HTTPException, TelephonyPermissionRequiredError):
     """Raised when attempting to place an outbound WhatsApp call without recipient permission."""
 
     def __init__(
@@ -82,17 +82,17 @@ class WhatsAppPermissionRequiredError(TelephonyPermissionRequiredError, HTTPExce
             f"Permission to call {phone_number} has not been granted or has been revoked by the recipient. "
             "Please send a WhatsApp call permission request first."
         )
+        HTTPException.__init__(
+            self,
+            status_code=400,
+            detail=msg,
+        )
         TelephonyPermissionRequiredError.__init__(
             self,
             message=msg,
             status=status or "missing",
             can_request_permission=can_request_permission,
             request_limit_reason=request_limit_reason,
-        )
-        HTTPException.__init__(
-            self,
-            status_code=400,
-            detail=msg,
         )
 
 
@@ -312,7 +312,7 @@ class WhatsAppProvider(TelephonyProvider):
                     if act.get("action_name") == "send_call_permission_request":
                         can_request_perm = bool(act.get("can_perform_action", True))
 
-                if can_start_call or meta_status in ("granted", "temporary", "permanent", "granted_temporary", "granted_permanent"):
+                if can_start_call or is_granted_permission_status(meta_status):
                     has_permission = True
                     try:
                         if org_id and telephony_config_id:

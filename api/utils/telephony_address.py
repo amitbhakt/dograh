@@ -41,12 +41,12 @@ class NormalizedAddress:
     country_code: Optional[str] = None  # ISO-2; only set for PSTN when known
 
 
-_E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
+_E164_RE = re.compile(r"^\+[1-9][0-9]{7,14}$")
 
 
 def is_e164(raw: Optional[str]) -> bool:
     """Whether ``raw`` carries an explicit country code in strict E.164 form
-    (leading '+', no internal punctuation or whitespace, 8-15 digits, non-zero country code).
+    (leading '+', no internal or surrounding punctuation or whitespace, 8-15 digits, non-zero country code).
 
     The single definition of "this number says which country it is for". Callers
     that must not guess a country - notably the WhatsApp business-initiated-call
@@ -61,7 +61,7 @@ def is_e164(raw: Optional[str]) -> bool:
     """
     if not raw or not isinstance(raw, str):
         return False
-    return bool(_E164_RE.fullmatch(raw.strip()))
+    return bool(_E164_RE.fullmatch(raw))
 
 
 def normalize_telephony_address(

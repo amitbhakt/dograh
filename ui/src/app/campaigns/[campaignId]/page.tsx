@@ -10,12 +10,12 @@ import {
     downloadCampaignReportApiV1CampaignCampaignIdReportGet,
     getCampaignApiV1CampaignCampaignIdGet,
     getCampaignSourceDownloadUrlApiV1CampaignCampaignIdSourceDownloadUrlGet,
+    listTelephonyConfigurationsApiV1OrganizationsTelephonyConfigsGet,
     pauseCampaignApiV1CampaignCampaignIdPausePost,
     redialCampaignApiV1CampaignCampaignIdRedialPost,
     resumeCampaignApiV1CampaignCampaignIdResumePost,
     startCampaignApiV1CampaignCampaignIdStartPost,
-    listTelephonyConfigurationsApiV1OrganizationsTelephonyConfigsGet,
-    syncWhatsAppPermissionsApiV1CampaignCampaignIdSyncWhatsappPermissionsPost,
+    syncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncPermissionsPost,
 } from '@/client/sdk.gen';
 import type { CampaignResponse, TelephonyConfigurationListItem } from '@/client/types.gen';
 import { Badge } from '@/components/ui/badge';
@@ -56,7 +56,6 @@ export default function CampaignDetailPage() {
     // Action state
     const [isExecutingAction, setIsExecutingAction] = useState(false);
     const [isDownloadingReport, setIsDownloadingReport] = useState(false);
-    const [isSyncingWhatsApp, setIsSyncingWhatsApp] = useState(false);
     const [runsRefreshTrigger, setRunsRefreshTrigger] = useState(0);
 
     // Report date range state
@@ -109,10 +108,13 @@ export default function CampaignDetailPage() {
         }
     }, [user, getAccessToken, campaignId]);
 
+    const [isFetchingTelephonyConfigs, setIsFetchingTelephonyConfigs] = useState(false);
+
     // Telephony configurations carry the provider, which the campaign response
     // does not; it is what decides whether this is a WhatsApp campaign.
     const fetchTelephonyConfigs = useCallback(async () => {
         if (!user) return;
+        setIsFetchingTelephonyConfigs(true);
         try {
             const accessToken = await getAccessToken();
             const res = await listTelephonyConfigurationsApiV1OrganizationsTelephonyConfigsGet({
@@ -131,6 +133,8 @@ export default function CampaignDetailPage() {
             // sync below. Surface the failure and let the user retry instead.
             setTelephonyConfigsError(true);
             toast.error('Failed to load telephony configuration. WhatsApp-specific actions may be unavailable until this is retried.');
+        } finally {
+            setIsFetchingTelephonyConfigs(false);
         }
     }, [user, getAccessToken]);
 
@@ -243,42 +247,35 @@ export default function CampaignDetailPage() {
     // Handle manual sync WhatsApp call permissions with Meta
     const handleSyncWhatsAppPermissions = async () => {
         if (!user) return;
-        setIsSyncingWhatsApp(true);
         try {
             const accessToken = await getAccessToken();
-            const response = await syncWhatsAppPermissionsApiV1CampaignCampaignIdSyncWhatsappPermissionsPost({
-                path: {
-                    campaign_id: campaignId,
-                },
+            const response = await syncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncPermissionsPost({
+                path: { campaign_id: campaignId },
                 headers: {
                     'Authorization': `Bearer ${accessToken}`,
                 },
             });
 
             if (response.data) {
-                const reactivated = response.data.reactivated_count || 0;
-                if (reactivated > 0) {
-                    toast.success(`WhatsApp permissions synced: ${reactivated} lead${reactivated > 1 ? 's' : ''} unparked and queued for calling!`);
+                if (response.data.throttled) {
+                    toast.info('Permission sync is on cooldown. Please wait a few seconds before trying again.');
                 } else {
-                    toast.info('WhatsApp permissions synced. No new permissions were granted by recipients yet.');
+                    const reactivated = response.data.reactivated_count || 0;
+                    if (reactivated > 0) {
+                        toast.success(`WhatsApp permissions synced: ${reactivated} lead${reactivated > 1 ? 's' : ''} unparked and queued for calling!`);
+                    } else {
+                        toast.info('WhatsApp permissions synced. No new permissions were granted by recipients yet.');
+                    }
                 }
                 // Refresh campaign stats and runs table
                 await fetchCampaign();
                 setRunsRefreshTrigger((prev) => prev + 1);
             } else if (response.error) {
-                let errorMsg = 'Failed to sync WhatsApp permissions';
-                if (typeof response.error === 'string') {
-                    errorMsg = response.error;
-                } else if (response.error && typeof response.error === 'object') {
-                    errorMsg = (response.error as unknown as { detail?: string }).detail || JSON.stringify(response.error);
-                }
-                toast.error(errorMsg);
+                toast.error(detailFromError(response.error, 'Failed to sync WhatsApp permissions'));
             }
         } catch (error) {
             console.error('Failed to sync WhatsApp permissions:', error);
             toast.error('Failed to sync WhatsApp permissions');
-        } finally {
-            setIsSyncingWhatsApp(false);
         }
     };
 
@@ -691,6 +688,7 @@ export default function CampaignDetailPage() {
                         <Button
                             variant="outline"
                             size="sm"
+                            disabled={isFetchingTelephonyConfigs}
                             onClick={() => fetchTelephonyConfigs()}
                         >
                             Retry

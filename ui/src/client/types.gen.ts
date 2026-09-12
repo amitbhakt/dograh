@@ -1112,6 +1112,10 @@ export type CampaignResponse = {
      */
     telephony_configuration_name?: string | null;
     /**
+     * Whatsapp Permission Action
+     */
+    whatsapp_permission_action?: string | null;
+    /**
      * Logs
      */
     logs?: Array<CampaignLogEntryResponse>;
@@ -1554,6 +1558,10 @@ export type CreateCampaignRequest = {
     max_concurrency?: number | null;
     schedule_config?: ScheduleConfigRequest | null;
     circuit_breaker?: CircuitBreakerConfigRequest | null;
+    /**
+     * Whatsapp Permission Action
+     */
+    whatsapp_permission_action?: string | null;
 };
 
 /**
@@ -2681,6 +2689,44 @@ export type EndTextChatSessionRequest = {
      * Expected Revision
      */
     expected_revision?: number | null;
+};
+
+/**
+ * ExotelConfigurationRequest
+ */
+export type ExotelConfigurationRequest = {
+    /**
+     * Provider
+     */
+    provider?: 'exotel';
+    /**
+     * Account Sid
+     *
+     * Exotel Account SID
+     */
+    account_sid: string;
+    /**
+     * Api Key
+     *
+     * Exotel API Key
+     */
+    api_key: string;
+    /**
+     * Api Token
+     *
+     * Exotel API Token
+     */
+    api_token: string;
+    /**
+     * Api Base Url
+     *
+     * Exotel API base URL. Use https://api.in.exotel.com for India or https://api.exotel.com for other regions.
+     */
+    api_base_url?: string;
+    /**
+     * From Numbers
+     */
+    from_numbers?: Array<string>;
 };
 
 /**
@@ -6033,6 +6079,8 @@ export type TelephonyConfigurationCreateRequest = {
     } & AriConfigurationRequest) | ({
         provider: 'cloudonix';
     } & CloudonixConfigurationRequest) | ({
+        provider: 'exotel';
+    } & ExotelConfigurationRequest) | ({
         provider: 'plivo';
     } & PlivoConfigurationRequest) | ({
         provider: 'telnyx';
@@ -6042,7 +6090,9 @@ export type TelephonyConfigurationCreateRequest = {
         provider: 'vobiz';
     } & VobizConfigurationRequest) | ({
         provider: 'vonage';
-    } & VonageConfigurationRequest);
+    } & VonageConfigurationRequest) | ({
+        provider: 'whatsapp';
+    } & WhatsAppConfigurationRequest);
 };
 
 /**
@@ -6197,6 +6247,8 @@ export type TelephonyConfigurationUpdateRequest = {
     } & AriConfigurationRequest) | ({
         provider: 'cloudonix';
     } & CloudonixConfigurationRequest) | ({
+        provider: 'exotel';
+    } & ExotelConfigurationRequest) | ({
         provider: 'plivo';
     } & PlivoConfigurationRequest) | ({
         provider: 'telnyx';
@@ -6206,7 +6258,9 @@ export type TelephonyConfigurationUpdateRequest = {
         provider: 'vobiz';
     } & VobizConfigurationRequest) | ({
         provider: 'vonage';
-    } & VonageConfigurationRequest) | null;
+    } & VonageConfigurationRequest) | ({
+        provider: 'whatsapp';
+    } & WhatsAppConfigurationRequest) | null;
 };
 
 /**
@@ -6894,6 +6948,10 @@ export type UpdateCampaignRequest = {
     max_concurrency?: number | null;
     schedule_config?: ScheduleConfigRequest | null;
     circuit_breaker?: CircuitBreakerConfigRequest | null;
+    /**
+     * Whatsapp Permission Action
+     */
+    whatsapp_permission_action?: string | null;
 };
 
 /**
@@ -7389,6 +7447,171 @@ export type VonageConfigurationRequest = {
  * Webhook credential authentication types
  */
 export type WebhookCredentialType = 'none' | 'api_key' | 'bearer_token' | 'basic_auth' | 'custom_header';
+
+/**
+ * WhatsAppCampaignPermissionSyncResponse
+ *
+ * Response payload for POST /whatsapp/campaigns/{id}/sync-permissions.
+ *
+ * Declared rather than returned as a bare dict so the shape reaches the
+ * generated TypeScript client: ``throttled`` is the difference between "the
+ * cooldown skipped this run" and "Meta says nobody has granted yet", and a
+ * caller that has to guess at an untyped body is how that distinction gets
+ * dropped.
+ */
+export type WhatsAppCampaignPermissionSyncResponse = {
+    /**
+     * Success
+     */
+    success: boolean;
+    /**
+     * Campaign Id
+     */
+    campaign_id: number;
+    /**
+     * Reactivated Count
+     */
+    reactivated_count: number;
+    /**
+     * Throttled
+     */
+    throttled: boolean;
+};
+
+/**
+ * WhatsAppConfigurationRequest
+ *
+ * Request schema for WhatsApp configuration.
+ *
+ * This schema validates incoming configuration save requests and
+ * integrates with Dograh's metadata-driven UI forms.
+ *
+ * Attributes:
+ * provider: Literal discriminator for union typing
+ * access_token: WhatsApp Business API access token
+ * phone_number_id: Business phone number ID from Meta
+ * webhook_verify_token: Token for webhook verification
+ * app_secret: App secret for webhook signature validation
+ * business_initiated_calls_enabled: Enable outbound calling
+ * call_icon_visibility: Control call icon display in WhatsApp
+ * default_permission_message: Custom body text for call permission request messages
+ */
+export type WhatsAppConfigurationRequest = {
+    /**
+     * Provider
+     */
+    provider?: 'whatsapp';
+    /**
+     * Access Token
+     *
+     * WhatsApp Business API access token
+     */
+    access_token: string;
+    /**
+     * Phone Number Id
+     *
+     * Business phone number ID
+     */
+    phone_number_id: string;
+    /**
+     * Webhook Verify Token
+     *
+     * Webhook verification token
+     */
+    webhook_verify_token: string;
+    /**
+     * App Secret
+     *
+     * App secret for webhook signature validation
+     */
+    app_secret: string;
+    /**
+     * Business Initiated Calls Enabled
+     *
+     * Enable business-initiated calls to WhatsApp users
+     */
+    business_initiated_calls_enabled?: boolean;
+    /**
+     * Call Icon Visibility
+     *
+     * Control when call icon appears to users
+     */
+    call_icon_visibility?: 'enabled' | 'disabled' | 'business_hours';
+    /**
+     * Default Permission Message
+     *
+     * Custom body text sent with call permission requests
+     */
+    default_permission_message?: string | null;
+};
+
+/**
+ * WhatsAppPermissionCheckResponse
+ *
+ * Response payload for GET /whatsapp/permissions/check.
+ */
+export type WhatsAppPermissionCheckResponse = {
+    /**
+     * Can Call
+     */
+    can_call: boolean;
+    /**
+     * Status
+     */
+    status: string;
+    /**
+     * Permission Type
+     */
+    permission_type?: string | null;
+    /**
+     * Expires At
+     */
+    expires_at?: string | null;
+    /**
+     * Hours Remaining
+     */
+    hours_remaining?: number | null;
+    /**
+     * Restricted Country
+     */
+    restricted_country?: boolean;
+    /**
+     * Restriction Reason
+     */
+    restriction_reason?: string | null;
+    /**
+     * Delivery Error
+     */
+    delivery_error?: string | null;
+    /**
+     * Can Request Permission
+     */
+    can_request_permission?: boolean;
+    /**
+     * Request Limit Reason
+     */
+    request_limit_reason?: string | null;
+};
+
+/**
+ * WhatsAppPermissionRequestPayload
+ *
+ * Request payload for POST /whatsapp/permissions/request.
+ */
+export type WhatsAppPermissionRequestPayload = {
+    /**
+     * Telephony Configuration Id
+     */
+    telephony_configuration_id: number;
+    /**
+     * Recipient Phone Number
+     */
+    recipient_phone_number: string;
+    /**
+     * Body Text
+     */
+    body_text?: string | null;
+};
 
 /**
  * WidgetTexts
@@ -8210,6 +8433,90 @@ export type InitiateCallApiV1TelephonyInitiateCallPostResponses = {
     200: unknown;
 };
 
+export type GetWorkflowRunCallStatusApiV1TelephonyRunsWorkflowRunIdCallStatusGetData = {
+    body?: never;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string | null;
+        /**
+         * X-Api-Key
+         */
+        'X-API-Key'?: string | null;
+    };
+    path: {
+        /**
+         * Workflow Run Id
+         */
+        workflow_run_id: number;
+    };
+    query?: never;
+    url: '/api/v1/telephony/runs/{workflow_run_id}/call-status';
+};
+
+export type GetWorkflowRunCallStatusApiV1TelephonyRunsWorkflowRunIdCallStatusGetErrors = {
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type GetWorkflowRunCallStatusApiV1TelephonyRunsWorkflowRunIdCallStatusGetError = GetWorkflowRunCallStatusApiV1TelephonyRunsWorkflowRunIdCallStatusGetErrors[keyof GetWorkflowRunCallStatusApiV1TelephonyRunsWorkflowRunIdCallStatusGetErrors];
+
+export type GetWorkflowRunCallStatusApiV1TelephonyRunsWorkflowRunIdCallStatusGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type EndWorkflowRunCallApiV1TelephonyRunsWorkflowRunIdEndCallPostData = {
+    body?: never;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string | null;
+        /**
+         * X-Api-Key
+         */
+        'X-API-Key'?: string | null;
+    };
+    path: {
+        /**
+         * Workflow Run Id
+         */
+        workflow_run_id: number;
+    };
+    query?: never;
+    url: '/api/v1/telephony/runs/{workflow_run_id}/end-call';
+};
+
+export type EndWorkflowRunCallApiV1TelephonyRunsWorkflowRunIdEndCallPostErrors = {
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type EndWorkflowRunCallApiV1TelephonyRunsWorkflowRunIdEndCallPostError = EndWorkflowRunCallApiV1TelephonyRunsWorkflowRunIdEndCallPostErrors[keyof EndWorkflowRunCallApiV1TelephonyRunsWorkflowRunIdEndCallPostErrors];
+
+export type EndWorkflowRunCallApiV1TelephonyRunsWorkflowRunIdEndCallPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
 export type HandleInboundRunApiV1TelephonyInboundRunPostData = {
     body?: never;
     path?: never;
@@ -8225,6 +8532,27 @@ export type HandleInboundRunApiV1TelephonyInboundRunPostErrors = {
 };
 
 export type HandleInboundRunApiV1TelephonyInboundRunPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type HandleInboundRunApiV1TelephonyInboundRunPost2Data = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/telephony/inbound/run';
+};
+
+export type HandleInboundRunApiV1TelephonyInboundRunPost2Errors = {
+    /**
+     * Not found
+     */
+    404: unknown;
+};
+
+export type HandleInboundRunApiV1TelephonyInboundRunPost2Responses = {
     /**
      * Successful Response
      */
@@ -8395,6 +8723,38 @@ export type HandleCloudonixCdrApiV1TelephonyCloudonixCdrPostErrors = {
 };
 
 export type HandleCloudonixCdrApiV1TelephonyCloudonixCdrPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type HandleExotelStatusCallbackApiV1TelephonyExotelStatusCallbackWorkflowRunIdPostData = {
+    body?: never;
+    path: {
+        /**
+         * Workflow Run Id
+         */
+        workflow_run_id: number;
+    };
+    query?: never;
+    url: '/api/v1/telephony/exotel/status-callback/{workflow_run_id}';
+};
+
+export type HandleExotelStatusCallbackApiV1TelephonyExotelStatusCallbackWorkflowRunIdPostErrors = {
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type HandleExotelStatusCallbackApiV1TelephonyExotelStatusCallbackWorkflowRunIdPostError = HandleExotelStatusCallbackApiV1TelephonyExotelStatusCallbackWorkflowRunIdPostErrors[keyof HandleExotelStatusCallbackApiV1TelephonyExotelStatusCallbackWorkflowRunIdPostErrors];
+
+export type HandleExotelStatusCallbackApiV1TelephonyExotelStatusCallbackWorkflowRunIdPostResponses = {
     /**
      * Successful Response
      */
@@ -8704,6 +9064,303 @@ export type HandleVonageEventsWithoutRunApiV1TelephonyVonageEventsPostErrors = {
 };
 
 export type HandleVonageEventsWithoutRunApiV1TelephonyVonageEventsPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type HandleWebhookVerificationApiV1TelephonyWhatsappWebhookGetData = {
+    body?: never;
+    path?: never;
+    query: {
+        /**
+         * Hub.Mode
+         */
+        'hub.mode': string;
+        /**
+         * Hub.Verify Token
+         */
+        'hub.verify_token': string;
+        /**
+         * Hub.Challenge
+         */
+        'hub.challenge': string;
+    };
+    url: '/api/v1/telephony/whatsapp/webhook';
+};
+
+export type HandleWebhookVerificationApiV1TelephonyWhatsappWebhookGetErrors = {
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type HandleWebhookVerificationApiV1TelephonyWhatsappWebhookGetError = HandleWebhookVerificationApiV1TelephonyWhatsappWebhookGetErrors[keyof HandleWebhookVerificationApiV1TelephonyWhatsappWebhookGetErrors];
+
+export type HandleWebhookVerificationApiV1TelephonyWhatsappWebhookGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type HandleWhatsappWebhookApiV1TelephonyWhatsappWebhookPostData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/telephony/whatsapp/webhook';
+};
+
+export type HandleWhatsappWebhookApiV1TelephonyWhatsappWebhookPostErrors = {
+    /**
+     * Not found
+     */
+    404: unknown;
+};
+
+export type HandleWhatsappWebhookApiV1TelephonyWhatsappWebhookPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncWhatsappPermissionsPostData = {
+    body?: never;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string | null;
+        /**
+         * X-Api-Key
+         */
+        'X-API-Key'?: string | null;
+    };
+    path: {
+        /**
+         * Campaign Id
+         */
+        campaign_id: number;
+    };
+    query?: never;
+    url: '/api/v1/telephony/whatsapp/campaigns/{campaign_id}/sync-whatsapp-permissions';
+};
+
+export type SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncWhatsappPermissionsPostErrors = {
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncWhatsappPermissionsPostError = SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncWhatsappPermissionsPostErrors[keyof SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncWhatsappPermissionsPostErrors];
+
+export type SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncWhatsappPermissionsPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: WhatsAppCampaignPermissionSyncResponse;
+};
+
+export type SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncWhatsappPermissionsPostResponse = SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncWhatsappPermissionsPostResponses[keyof SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncWhatsappPermissionsPostResponses];
+
+export type SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncPermissionsPostData = {
+    body?: never;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string | null;
+        /**
+         * X-Api-Key
+         */
+        'X-API-Key'?: string | null;
+    };
+    path: {
+        /**
+         * Campaign Id
+         */
+        campaign_id: number;
+    };
+    query?: never;
+    url: '/api/v1/telephony/whatsapp/campaigns/{campaign_id}/sync-permissions';
+};
+
+export type SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncPermissionsPostErrors = {
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncPermissionsPostError = SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncPermissionsPostErrors[keyof SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncPermissionsPostErrors];
+
+export type SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncPermissionsPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: WhatsAppCampaignPermissionSyncResponse;
+};
+
+export type SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncPermissionsPostResponse = SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncPermissionsPostResponses[keyof SyncCampaignWhatsappPermissionsApiV1TelephonyWhatsappCampaignsCampaignIdSyncPermissionsPostResponses];
+
+export type CheckWhatsappPermissionApiV1TelephonyWhatsappPermissionsCheckGetData = {
+    body?: never;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string | null;
+        /**
+         * X-Api-Key
+         */
+        'X-API-Key'?: string | null;
+    };
+    path?: never;
+    query: {
+        /**
+         * Telephony Configuration Id
+         */
+        telephony_configuration_id: number;
+        /**
+         * Recipient Phone Number
+         */
+        recipient_phone_number: string;
+    };
+    url: '/api/v1/telephony/whatsapp/permissions/check';
+};
+
+export type CheckWhatsappPermissionApiV1TelephonyWhatsappPermissionsCheckGetErrors = {
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type CheckWhatsappPermissionApiV1TelephonyWhatsappPermissionsCheckGetError = CheckWhatsappPermissionApiV1TelephonyWhatsappPermissionsCheckGetErrors[keyof CheckWhatsappPermissionApiV1TelephonyWhatsappPermissionsCheckGetErrors];
+
+export type CheckWhatsappPermissionApiV1TelephonyWhatsappPermissionsCheckGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: WhatsAppPermissionCheckResponse;
+};
+
+export type CheckWhatsappPermissionApiV1TelephonyWhatsappPermissionsCheckGetResponse = CheckWhatsappPermissionApiV1TelephonyWhatsappPermissionsCheckGetResponses[keyof CheckWhatsappPermissionApiV1TelephonyWhatsappPermissionsCheckGetResponses];
+
+export type SendWhatsappPermissionRequestApiV1TelephonyWhatsappPermissionsRequestPostData = {
+    body: WhatsAppPermissionRequestPayload;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string | null;
+        /**
+         * X-Api-Key
+         */
+        'X-API-Key'?: string | null;
+    };
+    path?: never;
+    query?: never;
+    url: '/api/v1/telephony/whatsapp/permissions/request';
+};
+
+export type SendWhatsappPermissionRequestApiV1TelephonyWhatsappPermissionsRequestPostErrors = {
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type SendWhatsappPermissionRequestApiV1TelephonyWhatsappPermissionsRequestPostError = SendWhatsappPermissionRequestApiV1TelephonyWhatsappPermissionsRequestPostErrors[keyof SendWhatsappPermissionRequestApiV1TelephonyWhatsappPermissionsRequestPostErrors];
+
+export type SendWhatsappPermissionRequestApiV1TelephonyWhatsappPermissionsRequestPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type HandlePermissionCallbackApiV1TelephonyWhatsappPermissionsPostData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/telephony/whatsapp/permissions';
+};
+
+export type HandlePermissionCallbackApiV1TelephonyWhatsappPermissionsPostErrors = {
+    /**
+     * Not found
+     */
+    404: unknown;
+};
+
+export type HandlePermissionCallbackApiV1TelephonyWhatsappPermissionsPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type HandleTelephonyWebhookGetApiV1TelephonyWebhookGetData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/telephony/webhook';
+};
+
+export type HandleTelephonyWebhookGetApiV1TelephonyWebhookGetErrors = {
+    /**
+     * Not found
+     */
+    404: unknown;
+};
+
+export type HandleTelephonyWebhookGetApiV1TelephonyWebhookGetResponses = {
+    /**
+     * Successful Response
+     */
+    200: unknown;
+};
+
+export type HandleTelephonyWebhookPostApiV1TelephonyWebhookPostData = {
+    body?: never;
+    path?: never;
+    query?: never;
+    url: '/api/v1/telephony/webhook';
+};
+
+export type HandleTelephonyWebhookPostApiV1TelephonyWebhookPostErrors = {
+    /**
+     * Not found
+     */
+    404: unknown;
+};
+
+export type HandleTelephonyWebhookPostApiV1TelephonyWebhookPostResponses = {
     /**
      * Successful Response
      */
@@ -12316,6 +12973,50 @@ export type UpdateTelephonyConfigurationApiV1OrganizationsTelephonyConfigsConfig
 
 export type UpdateTelephonyConfigurationApiV1OrganizationsTelephonyConfigsConfigIdPutResponse = UpdateTelephonyConfigurationApiV1OrganizationsTelephonyConfigsConfigIdPutResponses[keyof UpdateTelephonyConfigurationApiV1OrganizationsTelephonyConfigsConfigIdPutResponses];
 
+export type SyncTelephonyConfigurationPhoneNumbersApiV1OrganizationsTelephonyConfigsConfigIdSyncPhoneNumbersPostData = {
+    body?: never;
+    headers?: {
+        /**
+         * Authorization
+         */
+        authorization?: string | null;
+        /**
+         * X-Api-Key
+         */
+        'X-API-Key'?: string | null;
+    };
+    path: {
+        /**
+         * Config Id
+         */
+        config_id: number;
+    };
+    query?: never;
+    url: '/api/v1/organizations/telephony-configs/{config_id}/sync-phone-numbers';
+};
+
+export type SyncTelephonyConfigurationPhoneNumbersApiV1OrganizationsTelephonyConfigsConfigIdSyncPhoneNumbersPostErrors = {
+    /**
+     * Not found
+     */
+    404: unknown;
+    /**
+     * Validation Error
+     */
+    422: HttpValidationError;
+};
+
+export type SyncTelephonyConfigurationPhoneNumbersApiV1OrganizationsTelephonyConfigsConfigIdSyncPhoneNumbersPostError = SyncTelephonyConfigurationPhoneNumbersApiV1OrganizationsTelephonyConfigsConfigIdSyncPhoneNumbersPostErrors[keyof SyncTelephonyConfigurationPhoneNumbersApiV1OrganizationsTelephonyConfigsConfigIdSyncPhoneNumbersPostErrors];
+
+export type SyncTelephonyConfigurationPhoneNumbersApiV1OrganizationsTelephonyConfigsConfigIdSyncPhoneNumbersPostResponses = {
+    /**
+     * Successful Response
+     */
+    200: ProviderSyncStatus;
+};
+
+export type SyncTelephonyConfigurationPhoneNumbersApiV1OrganizationsTelephonyConfigsConfigIdSyncPhoneNumbersPostResponse = SyncTelephonyConfigurationPhoneNumbersApiV1OrganizationsTelephonyConfigsConfigIdSyncPhoneNumbersPostResponses[keyof SyncTelephonyConfigurationPhoneNumbersApiV1OrganizationsTelephonyConfigsConfigIdSyncPhoneNumbersPostResponses];
+
 export type SetDefaultOutboundApiV1OrganizationsTelephonyConfigsConfigIdSetDefaultOutboundPostData = {
     body?: never;
     headers?: {
@@ -15572,21 +16273,3 @@ export type AutoscaleMetricApiV1HealthAutoscaleMetricGetResponses = {
 };
 
 export type AutoscaleMetricApiV1HealthAutoscaleMetricGetResponse = AutoscaleMetricApiV1HealthAutoscaleMetricGetResponses[keyof AutoscaleMetricApiV1HealthAutoscaleMetricGetResponses];
-
-export type SyncWhatsAppPermissionsApiV1CampaignCampaignIdSyncWhatsappPermissionsPostData = {
-    headers?: {
-        authorization?: string | null;
-    };
-    path: {
-        campaign_id: number;
-    };
-    url: '/api/v1/campaign/{campaign_id}/sync-whatsapp-permissions';
-};
-
-export type SyncWhatsAppPermissionsApiV1CampaignCampaignIdSyncWhatsappPermissionsPostResponses = {
-    200: {
-        success: boolean;
-        campaign_id: number;
-        reactivated_count: number;
-    };
-};

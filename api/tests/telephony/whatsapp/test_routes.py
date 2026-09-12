@@ -1,5 +1,6 @@
 """Regression tests for WhatsApp webhook verification."""
 
+from contextlib import asynccontextmanager
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -49,6 +50,34 @@ class TestWhatsAppRoutes(IsolatedAsyncioTestCase):
 
         self.assertEqual(ctx.exception.status_code, 403)
         self.assertEqual(ctx.exception.detail, "Invalid verification token")
+
+    async def test_verify_token_lookup_refuses_an_ambiguous_match(self):
+        """A token two tenants share identifies neither, so the lookup returns None.
+
+        Meta's handshake carries only hub.verify_token - no app or phone-number
+        id - so taking the first matching row would complete one tenant's
+        subscription against another tenant's configuration.
+        """
+        from api.db.telephony_configuration_client import TelephonyConfigurationClient
+
+        client = TelephonyConfigurationClient()
+        mock_session = AsyncMock()
+        result = MagicMock()
+        result.scalars.return_value.all.return_value = [
+            MagicMock(id=1),
+            MagicMock(id=2),
+        ]
+        mock_session.execute = AsyncMock(return_value=result)
+
+        @asynccontextmanager
+        async def fake_session():
+            yield mock_session
+
+        client.async_session = fake_session
+
+        self.assertIsNone(
+            await client.get_whatsapp_configuration_by_verify_token("shared-token")
+        )
 
     async def test_whatsapp_webhook_verification_matches_db_token(self):
         mock_config = MagicMock()
@@ -320,4 +349,27 @@ class TestWhatsAppRoutes(IsolatedAsyncioTestCase):
                 )
             self.assertEqual(ctx.exception.status_code, 401)
             self.assertIn("access token has expired", ctx.exception.detail)
+
+    def test_whatsapp_campaign_sync_permission_routes_registered(self):
+        """Verify the provider package registers both sync-permissions and sync-whatsapp-permissions endpoints."""
+        paths = [route.path for route in router.routes if getattr(route, "path", None)]
+        self.assertIn("/whatsapp/campaigns/{campaign_id}/sync-permissions", paths)
+        self.assertIn("/whatsapp/campaigns/{campaign_id}/sync-whatsapp-permissions", paths)
+
+    def test_campaign_routes_and_app_do_not_import_whatsapp_routes(self):
+        """Verify repository directives:
+        1. Keep registration import driven (app lifespan does not import or call install_whatsapp_pipeline_runner).
+        2. Keep provider routes isolated (api.routes.campaign does not import whatsapp.routes).
+        """
+        import inspect
+        import api.app as app_mod
+        import api.routes.campaign as campaign_mod
+
+        app_src = inspect.getsource(app_mod)
+        self.assertNotIn("install_whatsapp_pipeline_runner", app_src)
+        self.assertNotIn("api.services.telephony.providers.whatsapp.routes", app_src)
+
+        campaign_src = inspect.getsource(campaign_mod)
+        self.assertNotIn("api.services.telephony.providers.whatsapp.routes", campaign_src)
+        self.assertNotIn("sync-whatsapp-permissions", campaign_src)
 

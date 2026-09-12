@@ -41,33 +41,12 @@ def _restricted_reason(name: str) -> str:
 def is_restricted_country(phone_number: str) -> Tuple[bool, Optional[str]]:
     """Check whether a number is in one of Meta's restricted BIC countries.
 
-    Classifies only numbers that state their country, i.e. E.164 with a leading
-    "+". Every path that reaches an outbound call now guarantees that:
-    campaign leads are rejected at ingest without one (``validate_source_data``),
-    and the test-call and public API routes enforce ``is_e164`` on the resolved
-    number. So a bare number never arrives here, and this does not try to infer
-    a country from one.
-
-    That inference used to live here and could not be made correct. A bare
-    11-digit number starting with "1" is either a US number carrying its country
-    code or a Chinese mobile without one, and nothing in the digits separates
-    them - so the rule either blocked legitimate Chinese calls or let US calls
-    through. Requiring the country code upstream removes the ambiguity instead
-    of choosing which way to be wrong.
-
-    A "+" anywhere in the input (``"++20..."``, ``"+ +20..."``) still counts:
-    all "+" are dropped and one canonical leading "+" is re-added before
-    matching. This mirrors the dial path, which strips every non-digit and
-    redials ``f"+{digits}"`` - so a malformed extra "+" cannot smuggle a
-    restricted destination past this gate.
-
+    Classifies numbers in E.164 format with a leading "+" or digits.
     Returns:
         Tuple of (is_restricted: bool, reason: Optional[str])
     """
     stripped = _NON_DIAL_CHARS_RE.sub("", phone_number.strip())
     if "+" not in stripped:
-        # No country code: not classifiable, and by the invariant above this
-        # should not reach a dial path. Nothing to assert about it here.
         return False, None
 
     digits_only = stripped.replace("+", "")
@@ -83,11 +62,22 @@ def is_restricted_country(phone_number: str) -> Tuple[bool, Optional[str]]:
 
 
 def validate_destination_country(phone_number: str) -> None:
-    """Validate that the destination phone number is not in Meta's restricted countries.
+    """Validate that the destination phone number is valid E.164 and not in Meta's restricted countries.
 
     Raises:
-        HTTPException: 400 if the destination is in a restricted country.
+        HTTPException: 400 if the destination is invalid E.164 or in a restricted country.
     """
+    from api.utils.telephony_address import is_e164
+
+    if not is_e164(phone_number):
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Phone number must be in strict E.164 format, including the country "
+                f"code with a leading '+' (e.g. +14155552671). Got: {phone_number!r}"
+            ),
+        )
+
     restricted, reason = is_restricted_country(phone_number)
     if restricted:
         raise HTTPException(status_code=400, detail=reason)

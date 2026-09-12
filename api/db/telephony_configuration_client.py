@@ -440,7 +440,15 @@ class TelephonyConfigurationClient(BaseDBClient):
     async def get_whatsapp_configuration_by_verify_token(
         self, verify_token: str
     ) -> Optional[TelephonyConfigurationModel]:
-        """Look up an active WhatsApp config matching a webhook verify token."""
+        """Look up the active WhatsApp config matching a webhook verify token.
+
+        Returns None when more than one matches. The verify token is the only
+        thing Meta's handshake carries - there is no app or phone-number id on
+        that request - so a token two tenants happen to share identifies
+        neither, and taking the first row would complete one tenant's
+        subscription against the other's configuration. Nothing forces these
+        tokens to be unique, so the ambiguity is resolved by refusing it.
+        """
         async with self.async_session() as session:
             stmt = select(TelephonyConfigurationModel).where(
                 TelephonyConfigurationModel.provider == "whatsapp",
@@ -451,7 +459,15 @@ class TelephonyConfigurationClient(BaseDBClient):
                 TelephonyConfigurationModel.inactive.is_(False),
             )
             result = await session.execute(stmt)
-            return result.scalars().first()
+            rows = list(result.scalars().all())
+            if len(rows) > 1:
+                logger.warning(
+                    f"[WhatsApp] {len(rows)} active configurations share this webhook "
+                    f"verify token (ids={[r.id for r in rows]}); refusing to verify "
+                    "against an ambiguous one."
+                )
+                return None
+            return rows[0] if rows else None
 
     async def set_telephony_configuration_inactive(
         self, config_id: int, organization_id: int, reason: str

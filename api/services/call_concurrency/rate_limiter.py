@@ -699,9 +699,8 @@ class RateLimiter:
                 "org_id": organization_id,
                 "from_number": from_number,
                 "telephony_configuration_id": tcid_value,
+                "token": token or "",
             }
-            if token is not None:
-                mapping["token"] = token
             await redis_client.hset(mapping_key, mapping=mapping)
             await redis_client.expire(mapping_key, 1800)  # 30 min TTL
             return True

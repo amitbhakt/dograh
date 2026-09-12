@@ -39,12 +39,8 @@ from api.errors.failure import (
     failure_already_reported,
     log_failure,
 )
-from api.routes.turn_credentials import (
-    TURN_HOST,
-    TURN_PORT,
-    TURN_SECRET,
-    generate_turn_credentials,
-)
+from api.constants import TURN_HOST, TURN_PORT, TURN_SECRET
+from api.services.turn import generate_turn_credentials
 from api.services.auth.depends import get_user_ws
 from api.services.call_concurrency import (
     CallConcurrencyLimitError,

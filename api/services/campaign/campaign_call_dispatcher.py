@@ -1,7 +1,7 @@
 import asyncio
 import time
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, NamedTuple, Optional
 
 from fastapi import HTTPException
 from loguru import logger
@@ -63,6 +63,26 @@ def _is_awaiting_dial(queued_run: Optional[QueuedRunModel]) -> bool:
     return retry_reason == PERMISSION_GRANTED_RETRY_REASON or (
         _is_awaiting_permission_retry_reason(retry_reason)
     )
+
+
+class DispatchResult(NamedTuple):
+    """What one ``dispatch_call`` did with the queued run it was given.
+
+    ``queued_run_finalized`` is True when dispatch itself ended the run -
+    permission denied, or the 24h wait for consent timed out. Those paths
+    already move the row to "processed", so ``process_batch``'s
+    ownership-guarded update finds nothing left to claim and would report a
+    finished run as unprocessed.
+
+    Returned rather than stamped on the workflow run or parked on the
+    dispatcher: the caller reads it off the call it just made, so there is no
+    process-local state to keep in sync across instances or tasks, and a
+    stand-in workflow run cannot fabricate the flag by answering to any
+    attribute. Unpacked as a tuple at the call site for the same reason.
+    """
+
+    workflow_run: Optional[WorkflowRunModel]
+    queued_run_finalized: bool = False
 
 
 class CampaignCallDispatcher:
@@ -165,7 +185,7 @@ class CampaignCallDispatcher:
                     )
 
                     # Dispatch the call
-                    workflow_run = await self.dispatch_call(
+                    _, dispatch_finalized = await self.dispatch_call(
                         queued_run, campaign, concurrency_slot
                     )
 
@@ -186,6 +206,12 @@ class CampaignCallDispatcher:
                             f"[Campaign {campaign_id}] Queued run {queued_run.id} stays queued "
                             f"(retry_reason={current_queued_run.retry_reason}) awaiting dial"
                         )
+                    elif dispatch_finalized:
+                        # dispatch_call already moved this run to "processed";
+                        # it is finished by this batch and counts as such.
+                        processed_count += 1
+                        processed_run_ids.add(queued_run.id)
+                        pending_processed_rows += 1
                     else:
                         # Conditional on this batch still owning the claim. A run
                         # that was parked, granted, then claimed and completed by
@@ -352,12 +378,14 @@ class CampaignCallDispatcher:
         queued_run: QueuedRunModel,
         campaign: any,
         concurrency_slot: CallConcurrencySlot,
-    ) -> Optional[WorkflowRunModel]:
+    ) -> DispatchResult:
         """Creates workflow run and initiates call. Requires a pre-acquired slot."""
         from_number = None
         from_number_token = None
         workflow_run = None
         slot_bound = False
+        # Set only by the paths below that end the queued run themselves.
+        queued_run_finalized = False
 
         try:
             # Get workflow details
@@ -629,6 +657,7 @@ class CampaignCallDispatcher:
                         state="processed",
                         processed_at=datetime.now(UTC),
                     )
+                    queued_run_finalized = True
 
                 # Missing consent is the recipient's choice, not an outage, so it
                 # must not trip the breaker. A permission request we could not
@@ -645,7 +674,7 @@ class CampaignCallDispatcher:
                     ),
                 )
                 await self.release_call_slot(workflow_run.id)
-                return workflow_run
+                return DispatchResult(workflow_run, queued_run_finalized)
 
             logger.error(
                 f"Failed to initiate call for workflow run {workflow_run.id}: {e}"
@@ -687,7 +716,7 @@ class CampaignCallDispatcher:
 
             raise
 
-        return workflow_run
+        return DispatchResult(workflow_run, queued_run_finalized)
 
     async def apply_rate_limit(self, organization_id: int, rate_limit: int) -> None:
         """

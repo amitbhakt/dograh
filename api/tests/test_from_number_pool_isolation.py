@@ -328,6 +328,9 @@ class TestDispatcherThreadsTelephonyConfig:
                     )
                 ]
             )
+            # dispatch_call reuses an unfinished run for the same queued run
+            # before creating one, so this lookup has to answer.
+            mock_db.get_workflow_run_by_queued_run_id = AsyncMock(return_value=None)
             mock_db.create_workflow_run = AsyncMock(return_value=workflow_run)
             mock_db.update_workflow_run = AsyncMock()
             mock_concurrency.bind_workflow_run = AsyncMock()
@@ -553,6 +556,9 @@ class TestDispatcherThreadsTelephonyConfig:
                     credentials={"phone_number_id": "phone_id_1"},
                 )
             )
+            # dispatch_call reuses an unfinished run for the same queued run
+            # before creating one, so this lookup has to answer.
+            mock_db.get_workflow_run_by_queued_run_id = AsyncMock(return_value=None)
             mock_db.create_workflow_run = AsyncMock(return_value=workflow_run)
             mock_db.update_workflow_run = AsyncMock()
             mock_concurrency.bind_workflow_run = AsyncMock()

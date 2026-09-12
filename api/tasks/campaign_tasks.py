@@ -254,7 +254,7 @@ async def process_campaign_batch(
 async def sweep_parked_whatsapp_permissions(ctx: Dict) -> int:
     """Cron job: periodic sweep across running campaigns to check and reactivate parked WhatsApp leads."""
     try:
-        from api.services.telephony.providers.whatsapp.routes import (
+        from api.services.telephony.providers.whatsapp.permission_sync import (
             sync_all_parked_whatsapp_permissions,
         )
 

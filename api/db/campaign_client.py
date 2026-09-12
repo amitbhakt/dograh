@@ -3,6 +3,7 @@ import re
 from datetime import UTC, datetime
 from typing import Any, Dict, List, Optional
 
+from loguru import logger
 from sqlalchemy import func, or_, text, update
 from sqlalchemy.future import select
 
@@ -604,17 +605,31 @@ class CampaignClient(BaseDBClient):
         """Set processed_rows to the number of finished queued runs.
 
         ``processed_rows`` is a cache of queued-run state, not an independent
-        fact, and three different writers used to maintain it by delta (batch
-        dispatch, permission denial, redial). Recomputing from the rows is
-        idempotent, so a retry, a duplicate webhook or an overlapping batch
-        cannot inflate campaign progress past the number of finished contacts.
+        fact, and it used to be maintained by delta from several places (batch
+        dispatch, permission denial, redial). Deltas cannot be replayed: a
+        duplicate webhook or an overlapping batch inflated progress past the
+        number of finished contacts, and a failed write lost it for good.
+        Recomputing is idempotent, so this is the only writer of the column -
+        every path that finishes a run calls it instead of adding its own one.
 
-        The count and the write happen in one statement rather than a SELECT
-        followed by an UPDATE: with two statements, an atomic increment (e.g.
-        ``fail_queued_run_permission_denied``) landing between them would be
-        clobbered by the stale count this then writes back.
+        The campaign row is locked before the count is taken, in two
+        statements, and that ordering is the point. PostgreSQL evaluates a
+        statement against the snapshot it started with, so a single
+        count-and-update that blocked on this lock would afterwards write a
+        count taken before the writer it waited for had committed - silently
+        undoing that run. Taking the lock first and counting in a new statement
+        gives the count a snapshot that includes everything committed up to the
+        moment the lock was granted.
         """
         async with self.async_session() as session:
+            locked = await session.execute(
+                text("SELECT id FROM campaigns WHERE id = :campaign_id FOR UPDATE"),
+                {"campaign_id": campaign_id},
+            )
+            if locked.scalar_one_or_none() is None:
+                await session.rollback()
+                raise ValueError(f"Campaign {campaign_id} not found")
+
             result = await session.execute(
                 text(
                     "UPDATE campaigns SET "
@@ -632,33 +647,6 @@ class CampaignClient(BaseDBClient):
             actual = result.scalar_one()
             await session.commit()
             return actual
-
-    async def increment_campaign_processed_rows(
-        self, campaign_id: int, delta: int = 1
-    ) -> int:
-        """Atomically increment campaigns.processed_rows and return the new value."""
-        async with self.async_session() as session:
-            result = await session.execute(
-                text(
-                    "UPDATE campaigns "
-                    "SET processed_rows = COALESCE(processed_rows, 0) + :delta, "
-                    "    updated_at = :now "
-                    "WHERE id = :campaign_id "
-                    "RETURNING processed_rows"
-                ),
-                {
-                    "campaign_id": campaign_id,
-                    "delta": delta,
-                    "now": datetime.now(UTC),
-                },
-            )
-            processed_rows = result.scalar_one()
-            try:
-                await session.commit()
-            except Exception:
-                await session.rollback()
-                raise
-            return processed_rows
 
     async def merge_campaign_orchestrator_metadata(
         self, campaign_id: int, updates: Dict[str, Any]
@@ -1237,11 +1225,11 @@ class CampaignClient(BaseDBClient):
         read from an unlocked row, so two concurrent deliveries of the same
         denial (Meta retries webhooks, and the messages webhook and cron sync
         can carry the same event) could both observe 'queued' and each add one
-        to processed_rows/failed_rows. It also could not tell a fresh denial
-        from a stale one for a run that had since been granted and claimed. The
-        conditional UPDATE below is the atomic gate: exactly one writer sees the
-        row in ('queued', 'awaiting_whatsapp_permission') and only that writer
-        touches the campaign counters.
+        to failed_rows. It also could not tell a fresh denial from a stale one
+        for a run that had since been granted and claimed. The conditional
+        UPDATE below is the atomic gate: exactly one writer sees the row in
+        ('queued', 'awaiting_whatsapp_permission'), and only that writer moves
+        failed_rows or recomputes processed_rows.
         """
         async with self.async_session() as session:
             now = datetime.now(UTC)
@@ -1268,16 +1256,24 @@ class CampaignClient(BaseDBClient):
                 await session.rollback()
                 return None
 
-            # The gate proved this run was still parked, so the counters move
-            # exactly once per run. Incrementing SQL-side rather than reading the
-            # campaign and writing back keeps this from clobbering a batch flush
-            # (which increments the same column atomically) that lands in between.
+            # The gate proved this run was still parked, so failed_rows moves
+            # exactly once per run. Incrementing SQL-side rather than reading
+            # the campaign and writing back keeps this from clobbering a
+            # concurrent writer of the same column.
+            #
+            # processed_rows is deliberately NOT incremented here. It is
+            # derived from queued-run state, and this transaction is what makes
+            # that state true; adding a delta as well would make this a second
+            # writer of a value sync_campaign_processed_rows recomputes, and
+            # the two cannot both be right - that increment is what the
+            # recompute then had to be clamped not to undo, which in turn made
+            # an overcount permanent. The recompute after this commits is the
+            # only writer.
             if run.campaign_id:
                 await session.execute(
                     update(CampaignModel)
                     .where(CampaignModel.id == run.campaign_id)
                     .values(
-                        processed_rows=func.coalesce(CampaignModel.processed_rows, 0) + 1,
                         failed_rows=func.coalesce(CampaignModel.failed_rows, 0) + 1,
                     )
                     .execution_options(synchronize_session=False)
@@ -1305,4 +1301,18 @@ class CampaignClient(BaseDBClient):
                 }
             await session.commit()
             await session.refresh(run)
-            return run
+
+        # Outside the transaction above: the run has to be committed as
+        # "failed" before a recount can include it. A failure here leaves
+        # progress stale until the next recompute - the queued-run state it is
+        # derived from is already durable - so it must not undo a denial that
+        # has landed.
+        if run.campaign_id:
+            try:
+                await self.sync_campaign_processed_rows(run.campaign_id)
+            except Exception as e:
+                logger.warning(
+                    f"Failed to refresh processed_rows for campaign "
+                    f"{run.campaign_id} after denying queued run {queued_run_id}: {e}"
+                )
+        return run

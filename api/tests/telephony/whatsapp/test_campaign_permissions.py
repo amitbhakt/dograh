@@ -27,6 +27,28 @@ from api.services.telephony.providers.whatsapp.provider import (
 )
 
 
+PERMISSION_SYNC = "api.services.telephony.providers.whatsapp.permission_sync"
+
+
+def patch_permission_sync(**targets):
+    """Patch names inside the permission-sync module.
+
+    Campaign permission orchestration lives in ``permission_sync`` and resolves
+    ``db_client`` / ``_get_redis`` / the Meta client from *its* globals. A test
+    that reaches it through ``routes`` and patches only ``routes.db_client``
+    rebinds a name the code under test never reads: the mock records nothing,
+    the real client is used, and every assertion about it fails - or worse,
+    passes because the real call raised and the code swallowed it. Tests that
+    cross that boundary patch both ends with this.
+    """
+    from contextlib import ExitStack
+
+    stack = ExitStack()
+    for name, value in targets.items():
+        stack.enter_context(patch(f"{PERMISSION_SYNC}.{name}", value))
+    return stack
+
+
 class TestWhatsAppPermissionExceptions(IsolatedAsyncioTestCase):
     """Test suite for WhatsAppPermissionRequiredError exception handling."""
 
@@ -117,7 +139,7 @@ class TestWhatsAppCampaignDispatcher(IsolatedAsyncioTestCase):
             mock_concurrency.bind_workflow_run = AsyncMock()
             mock_rate_limiter.store_workflow_from_number_mapping = AsyncMock()
 
-            run = await dispatcher.dispatch_call(
+            result = await dispatcher.dispatch_call(
                 queued_run=self.mock_queued_run,
                 campaign=self.mock_campaign,
                 concurrency_slot=self.mock_slot,
@@ -137,7 +159,11 @@ class TestWhatsAppCampaignDispatcher(IsolatedAsyncioTestCase):
             self.assertFalse(mock_record_cb.call_args[1].get("is_failure"))
             self.assertEqual(mock_record_cb.call_args[1].get("reason"), "whatsapp_permission_required")
 
-            self.assertIsNotNone(run)
+            # dispatch_call finished the run itself, so process_batch must be
+            # able to tell that apart from a run another batch completed.
+            self.assertTrue(result.queued_run_finalized)
+
+            self.assertIsNotNone(result.workflow_run)
 
     @patch("api.services.campaign.campaign_call_dispatcher.circuit_breaker.record_and_evaluate", new_callable=AsyncMock)
     @patch("api.services.campaign.campaign_call_dispatcher.mark_workflow_run_failed", new_callable=AsyncMock)
@@ -179,7 +205,7 @@ class TestWhatsAppCampaignDispatcher(IsolatedAsyncioTestCase):
             mock_concurrency.bind_workflow_run = AsyncMock()
             mock_rate_limiter.store_workflow_from_number_mapping = AsyncMock()
 
-            run = await dispatcher.dispatch_call(
+            result = await dispatcher.dispatch_call(
                 queued_run=self.mock_queued_run,
                 campaign=self.mock_campaign,
                 concurrency_slot=self.mock_slot,
@@ -214,7 +240,9 @@ class TestWhatsAppCampaignDispatcher(IsolatedAsyncioTestCase):
 
             # Circuit breaker recorded as not failure
             self.assertFalse(mock_record_cb.call_args[1].get("is_failure"))
-            self.assertIsNotNone(run)
+            self.assertIsNotNone(result.workflow_run)
+            # Parked, not finalized: a later batch still has to dial it.
+            self.assertFalse(result.queued_run_finalized)
 
     @patch("api.services.campaign.campaign_call_dispatcher.circuit_breaker.record_and_evaluate", new_callable=AsyncMock)
     @patch("api.services.campaign.campaign_call_dispatcher.mark_workflow_run_failed", new_callable=AsyncMock)
@@ -370,7 +398,7 @@ class TestWhatsAppCampaignDispatcher(IsolatedAsyncioTestCase):
             mock_concurrency.bind_workflow_run = AsyncMock()
             mock_rate_limiter.store_workflow_from_number_mapping = AsyncMock()
 
-            run = await dispatcher.dispatch_call(
+            result = await dispatcher.dispatch_call(
                 queued_run=self.mock_queued_run,
                 campaign=self.mock_campaign,
                 concurrency_slot=self.mock_slot,
@@ -384,7 +412,9 @@ class TestWhatsAppCampaignDispatcher(IsolatedAsyncioTestCase):
             self.assertEqual(mock_provider.initiate_call.call_args[1].get("workflow_run_id"), 999)
 
             # Returned run is the same existing run
-            self.assertEqual(run.id, 999)
+            self.assertEqual(result.workflow_run.id, 999)
+            # Nothing was finalized: the call went out.
+            self.assertFalse(result.queued_run_finalized)
 
     @patch("api.services.campaign.campaign_call_dispatcher.circuit_breaker.record_and_evaluate", new_callable=AsyncMock)
     @patch("api.services.campaign.campaign_call_dispatcher.mark_workflow_run_failed", new_callable=AsyncMock)
@@ -429,7 +459,7 @@ class TestWhatsAppCampaignDispatcher(IsolatedAsyncioTestCase):
             mock_concurrency.bind_workflow_run = AsyncMock()
             mock_rate_limiter.store_workflow_from_number_mapping = AsyncMock()
 
-            run = await dispatcher.dispatch_call(
+            result = await dispatcher.dispatch_call(
                 queued_run=self.mock_queued_run,
                 campaign=self.mock_campaign,
                 concurrency_slot=self.mock_slot,
@@ -452,7 +482,10 @@ class TestWhatsAppCampaignDispatcher(IsolatedAsyncioTestCase):
     @patch("api.services.campaign.campaign_call_dispatcher.db_client")
     async def test_process_batch_leaves_parked_run_queued(self, mock_db):
         """When a run is parked awaiting WhatsApp permission, process_batch must NOT mark it as processed."""
-        from api.services.campaign.campaign_call_dispatcher import CampaignCallDispatcher
+        from api.services.campaign.campaign_call_dispatcher import (
+            CampaignCallDispatcher,
+            DispatchResult,
+        )
 
         dispatcher = CampaignCallDispatcher()
         mock_campaign = MagicMock(id=42, organization_id=1, state="running", processed_rows=0, telephony_configuration_id=5, rate_limit_per_second=10)
@@ -469,7 +502,7 @@ class TestWhatsAppCampaignDispatcher(IsolatedAsyncioTestCase):
         with patch.object(dispatcher, "get_provider_for_campaign", new_callable=AsyncMock, return_value=MagicMock(from_numbers=[])), \
              patch.object(dispatcher, "apply_rate_limit", new_callable=AsyncMock), \
              patch.object(dispatcher, "acquire_concurrent_slot", new_callable=AsyncMock), \
-             patch.object(dispatcher, "dispatch_call", new_callable=AsyncMock, return_value=mock_wf_run):
+             patch.object(dispatcher, "dispatch_call", new_callable=AsyncMock, return_value=DispatchResult(mock_wf_run)):
 
             processed_count = await dispatcher.process_batch(campaign_id=42, batch_size=10)
 
@@ -478,6 +511,71 @@ class TestWhatsAppCampaignDispatcher(IsolatedAsyncioTestCase):
             # Processed count is 0 because the call is parked awaiting permission
             self.assertEqual(processed_count, 0)
             mock_db.update_campaign.assert_not_called()
+
+    @patch("api.services.campaign.campaign_call_dispatcher.db_client")
+    async def test_process_batch_counts_run_finalized_by_dispatch(self, mock_db):
+        """A run dispatch_call already finished (permission denied/timed out) counts as processed."""
+        from api.services.campaign.campaign_call_dispatcher import (
+            CampaignCallDispatcher,
+            DispatchResult,
+        )
+
+        dispatcher = CampaignCallDispatcher()
+        mock_campaign = MagicMock(id=42, organization_id=1, state="running", processed_rows=0, telephony_configuration_id=5, rate_limit_per_second=10)
+        mock_db.get_campaign_by_id = AsyncMock(return_value=mock_campaign)
+        mock_db.claim_queued_runs_for_processing = AsyncMock(return_value=[self.mock_queued_run])
+
+        # dispatch_call's denial path: the row is already "processed", so the
+        # ownership-guarded update below would claim nothing.
+        mock_finished = MagicMock(id=501, state="processed", retry_reason=None)
+        mock_db.get_queued_run_by_id = AsyncMock(return_value=mock_finished)
+        mock_db.mark_queued_run_processed_if_owned = AsyncMock(return_value=False)
+        mock_db.sync_campaign_processed_rows = AsyncMock(return_value=1)
+
+        async def finalizing_dispatch(*args, **kwargs):
+            return DispatchResult(MagicMock(id=999), queued_run_finalized=True)
+
+        with patch.object(dispatcher, "get_provider_for_campaign", new_callable=AsyncMock, return_value=MagicMock(from_numbers=[])), \
+             patch.object(dispatcher, "apply_rate_limit", new_callable=AsyncMock), \
+             patch.object(dispatcher, "acquire_concurrent_slot", new_callable=AsyncMock), \
+             patch.object(dispatcher, "dispatch_call", side_effect=finalizing_dispatch):
+
+            processed_count = await dispatcher.process_batch(campaign_id=42, batch_size=10)
+
+            # Counted, and not re-claimed: dispatch already owns the transition.
+            self.assertEqual(processed_count, 1)
+            mock_db.mark_queued_run_processed_if_owned.assert_not_called()
+            mock_db.sync_campaign_processed_rows.assert_awaited_once_with(42)
+
+    @patch("api.services.campaign.campaign_call_dispatcher.db_client")
+    async def test_process_batch_claims_run_when_dispatch_did_not_finalize(self, mock_db):
+        """Normal dial: process_batch owns the processed transition via the ownership guard."""
+        from api.services.campaign.campaign_call_dispatcher import (
+            CampaignCallDispatcher,
+            DispatchResult,
+        )
+
+        dispatcher = CampaignCallDispatcher()
+        mock_campaign = MagicMock(id=42, organization_id=1, state="running", processed_rows=0, telephony_configuration_id=5, rate_limit_per_second=10)
+        mock_db.get_campaign_by_id = AsyncMock(return_value=mock_campaign)
+        mock_db.claim_queued_runs_for_processing = AsyncMock(return_value=[self.mock_queued_run])
+
+        mock_claimed = MagicMock(id=501, state="processing", retry_reason=None)
+        mock_db.get_queued_run_by_id = AsyncMock(return_value=mock_claimed)
+        mock_db.mark_queued_run_processed_if_owned = AsyncMock(return_value=True)
+        mock_db.sync_campaign_processed_rows = AsyncMock(return_value=1)
+
+        with patch.object(dispatcher, "get_provider_for_campaign", new_callable=AsyncMock, return_value=MagicMock(from_numbers=[])), \
+             patch.object(dispatcher, "apply_rate_limit", new_callable=AsyncMock), \
+             patch.object(dispatcher, "acquire_concurrent_slot", new_callable=AsyncMock), \
+             patch.object(dispatcher, "dispatch_call", new_callable=AsyncMock, return_value=DispatchResult(MagicMock(id=999))):
+
+            processed_count = await dispatcher.process_batch(campaign_id=42, batch_size=10)
+
+            # A stand-in workflow run answers to any attribute; the finalization
+            # signal must come from the call's own result.
+            self.assertEqual(processed_count, 1)
+            mock_db.mark_queued_run_processed_if_owned.assert_awaited_once_with(501)
 
 
 class TestWhatsAppWebhookReactiveTrigger(IsolatedAsyncioTestCase):
@@ -505,11 +603,18 @@ class TestWhatsAppWebhookReactiveTrigger(IsolatedAsyncioTestCase):
         )
         mock_db.activate_queued_run_for_immediate_dial = AsyncMock()
 
+        # The grant is scoped to the configuration that owns this business
+        # number; a run whose campaign belongs to another one is not touched.
+        mock_db.get_whatsapp_configuration_by_phone_number_id = AsyncMock(
+            return_value=MagicMock(id=7)
+        )
+
         # Campaign is currently running
-        mock_campaign = MagicMock(id=42, state="running")
+        mock_campaign = MagicMock(id=42, state="running", telephony_configuration_id=7)
         mock_db.get_campaign_by_id = AsyncMock(return_value=mock_campaign)
 
-        with patch("api.tasks.arq.enqueue_job", new_callable=AsyncMock) as mock_enqueue:
+        with patch("api.tasks.arq.enqueue_job", new_callable=AsyncMock) as mock_enqueue, \
+             patch_permission_sync(db_client=mock_db):
             change_value = {
                 "user_call_permissions": [
                     {
@@ -607,8 +712,15 @@ class TestWhatsAppWebhookReactiveTrigger(IsolatedAsyncioTestCase):
             return_value=[mock_parked_run]
         )
         mock_db.fail_queued_run_permission_denied = AsyncMock()
+        mock_db.get_whatsapp_configuration_by_phone_number_id = AsyncMock(
+            return_value=MagicMock(id=7)
+        )
+        mock_db.get_campaign_by_id = AsyncMock(
+            return_value=MagicMock(id=42, state="running", telephony_configuration_id=7)
+        )
 
-        with patch("api.tasks.arq.enqueue_job", new_callable=AsyncMock) as mock_enqueue:
+        with patch("api.tasks.arq.enqueue_job", new_callable=AsyncMock) as mock_enqueue, \
+             patch_permission_sync(db_client=mock_db):
             change_value = {
                 "user_call_permissions": [
                     {
@@ -645,7 +757,9 @@ class TestWhatsAppWebhookReactiveTrigger(IsolatedAsyncioTestCase):
             return_value=[mock_parked_run]
         )
         mock_db.activate_queued_run_for_immediate_dial = AsyncMock()
-        mock_db.get_campaign_by_id = AsyncMock(return_value=MagicMock(id=42, state="running"))
+        mock_db.get_campaign_by_id = AsyncMock(
+            return_value=MagicMock(id=42, state="running", telephony_configuration_id=1)
+        )
         mock_config = MagicMock(
             id=1,
             credentials={"app_secret": "test_app_secret"},
@@ -696,7 +810,8 @@ class TestWhatsAppWebhookReactiveTrigger(IsolatedAsyncioTestCase):
         mock_request.body = AsyncMock(return_value=body_bytes)
         mock_request.headers = {"x-hub-signature-256": f"sha256={sig}"}
 
-        with patch("api.tasks.arq.enqueue_job", new_callable=AsyncMock) as mock_enqueue:
+        with patch("api.tasks.arq.enqueue_job", new_callable=AsyncMock) as mock_enqueue, \
+             patch_permission_sync(db_client=mock_db):
             res = await handle_whatsapp_webhook(mock_request)
             self.assertEqual(res, {"status": "success"})
 
@@ -742,11 +857,14 @@ class TestWhatsAppWebhookReactiveTrigger(IsolatedAsyncioTestCase):
             return_value=[mock_parked_run]
         )
         mock_db.activate_queued_run_for_immediate_dial = AsyncMock()
-        mock_db.get_campaign_by_id = AsyncMock(return_value=MagicMock(id=42, state="running"))
+        mock_db.get_campaign_by_id = AsyncMock(
+            return_value=MagicMock(id=42, state="running", telephony_configuration_id=5)
+        )
 
         mock_user = MagicMock(selected_organization_id=1)
 
-        with patch("api.tasks.arq.enqueue_job", new_callable=AsyncMock) as mock_enqueue:
+        with patch("api.tasks.arq.enqueue_job", new_callable=AsyncMock) as mock_enqueue, \
+             patch_permission_sync(db_client=mock_db):
             resp = await check_whatsapp_permission(
                 telephony_configuration_id=5,
                 recipient_phone_number="+917505327482",
@@ -801,7 +919,12 @@ class TestWhatsAppWebhookReactiveTrigger(IsolatedAsyncioTestCase):
         )
         mock_get_client.return_value = mock_client
 
-        with patch("api.tasks.arq.enqueue_job", new_callable=AsyncMock) as mock_enqueue:
+        with patch("api.tasks.arq.enqueue_job", new_callable=AsyncMock) as mock_enqueue, \
+             patch_permission_sync(
+                 db_client=mock_db,
+                 _get_redis=mock_get_redis,
+                 _get_or_create_whatsapp_client=mock_get_client,
+             ):
             result = await sync_whatsapp_permissions_for_campaign(20, force=True)
 
             # The helper now reports throttling alongside the count so a caller
@@ -826,10 +949,15 @@ class TestWhatsAppWebhookReactiveTrigger(IsolatedAsyncioTestCase):
         # No parked runs
         mock_db.get_all_queued_runs_awaiting_whatsapp_permission = AsyncMock(return_value=[])
 
-        result = await sync_whatsapp_permissions_for_campaign(20, force=False)
+        with patch_permission_sync(db_client=mock_db, _get_redis=mock_get_redis):
+            result = await sync_whatsapp_permissions_for_campaign(20, force=False)
 
         self.assertEqual(result.reactivated, 0)
         self.assertFalse(result.throttled)
+        # The parked-run read is what decided there was nothing to do - proof
+        # the mock was actually reached rather than an exception being
+        # swallowed into the same empty result.
+        mock_db.get_all_queued_runs_awaiting_whatsapp_permission.assert_awaited_once()
         # Cooldown must NOT have been armed
         mock_redis.set.assert_not_called()
 
@@ -901,8 +1029,14 @@ class TestWhatsAppPermissionFixes(IsolatedAsyncioTestCase):
         self.assertEqual(call_kwargs["telephony_configuration_id"], 10)
         self.assertEqual(call_kwargs["organization_id"], 2)
 
-    async def test_fail_queued_run_permission_denied_updates_processed_and_failed_rows(self):
-        """Issue 4: Permission denial updates campaign.processed_rows and failed_rows counters."""
+    async def test_fail_queued_run_permission_denied_updates_counters(self):
+        """A denial owns failed_rows, and delegates processed_rows to the recompute.
+
+        processed_rows is derived from queued-run state. This method is what
+        makes that state true, so it must not also add a delta - two writers of
+        one derived value cannot both be right, and the increment is what used
+        to inflate campaign progress past the number of finished contacts.
+        """
         from api.db.campaign_client import CampaignClient
         from api.db.models import CampaignModel, QueuedRunModel, WorkflowRunModel
 
@@ -924,7 +1058,10 @@ class TestWhatsAppPermissionFixes(IsolatedAsyncioTestCase):
         mock_session.commit = AsyncMock()
         mock_session.refresh = AsyncMock()
 
-        with patch.object(client, "async_session") as mock_ctx:
+        with patch.object(client, "async_session") as mock_ctx, \
+             patch.object(
+                 client, "sync_campaign_processed_rows", new_callable=AsyncMock
+             ) as mock_sync:
             mock_ctx.return_value.__aenter__.return_value = mock_session
             mock_ctx.return_value.__aexit__.return_value = None
 
@@ -933,10 +1070,23 @@ class TestWhatsAppPermissionFixes(IsolatedAsyncioTestCase):
             self.assertIsNotNone(res)
             self.assertEqual(mock_run.state, "failed")
             self.assertEqual(mock_run.retry_reason, "permission_denied")
-            self.assertEqual(mock_campaign.processed_rows, 6)
-            self.assertEqual(mock_campaign.failed_rows, 3)
             self.assertTrue(mock_wf_run.is_completed)
             self.assertEqual(mock_wf_run.gathered_context["call_disposition"], TelephonyCallStatus.PERMISSION_DENIED.value)
+
+            # The campaign counter this method owns is failed_rows, and it is
+            # moved SQL-side so a concurrent writer of the same column is not
+            # clobbered by a read-modify-write.
+            campaign_updates = [
+                str(call.args[0])
+                for call in mock_session.execute.call_args_list
+                if "UPDATE campaigns" in str(call.args[0])
+            ]
+            self.assertEqual(len(campaign_updates), 1)
+            self.assertIn("failed_rows", campaign_updates[0])
+            # No second writer for the derived column.
+            self.assertNotIn("processed_rows", campaign_updates[0])
+            # It is recomputed instead, after the denial has committed.
+            mock_sync.assert_awaited_once_with(42)
 
     async def test_get_queued_runs_phone_normalization_and_formatting(self):
         """Issues 2 & 5: get_queued_runs_awaiting_whatsapp_permission filters in SQL and matches formatted numbers."""
@@ -1033,6 +1183,11 @@ class TestWhatsAppPermissionFixes(IsolatedAsyncioTestCase):
 
     @patch("api.services.telephony.providers.whatsapp.routes.db_client")
     async def test_user_call_permissions_rejected_when_configuration_not_found(self, mock_db):
+        # An unknown phone_number_id has no app_secret to verify the payload
+        # against, so the request is rejected as unverifiable (403) rather than
+        # as unknown (404) - the signature gate runs before any lookup, and
+        # answering 404 here would tell an unauthenticated caller which
+        # business numbers exist.
         """P0 Violation: user_call_permissions must not bypass authentication when config lookup fails."""
         from api.services.telephony.providers.whatsapp.routes import handle_whatsapp_webhook
         from fastapi import HTTPException, Request
@@ -1057,7 +1212,7 @@ class TestWhatsAppPermissionFixes(IsolatedAsyncioTestCase):
 
         with self.assertRaises(HTTPException) as ctx:
             await handle_whatsapp_webhook(mock_request)
-        self.assertEqual(ctx.exception.status_code, 404)
+        self.assertEqual(ctx.exception.status_code, 403)
 
     @patch("api.services.telephony.providers.whatsapp.routes.db_client")
     async def test_user_call_permissions_rejected_without_signature(self, mock_db):
@@ -1114,7 +1269,8 @@ class TestWhatsAppPermissionFixes(IsolatedAsyncioTestCase):
 
         mock_db.get_campaign_by_id = AsyncMock(side_effect=mock_get_campaign)
 
-        with patch("api.tasks.arq.enqueue_job", new_callable=AsyncMock) as mock_enqueue:
+        with patch("api.tasks.arq.enqueue_job", new_callable=AsyncMock) as mock_enqueue, \
+             patch_permission_sync(db_client=mock_db):
             count = await reactivate_campaign_runs_for_recipient(
                 phone_number="+15551234567",
                 status="granted_temporary",
@@ -1125,6 +1281,36 @@ class TestWhatsAppPermissionFixes(IsolatedAsyncioTestCase):
             self.assertEqual(count, 1)
             mock_db.activate_queued_run_for_immediate_dial.assert_called_once_with(101)
             mock_enqueue.assert_called_once_with("process_campaign_batch", 1, 10)
+
+    @patch("api.services.telephony.providers.whatsapp.routes._get_redis", new_callable=AsyncMock)
+    @patch("api.services.telephony.providers.whatsapp.routes.db_client")
+    async def test_reactivate_skips_enqueue_when_activation_claim_is_lost(self, mock_db, mock_get_redis):
+        """A duplicate grant that activates nothing must not report runs or wake the campaign."""
+        from api.services.telephony.providers.whatsapp.routes import reactivate_campaign_runs_for_recipient
+
+        run1 = MagicMock(id=101, campaign_id=1)
+        mock_db.get_queued_runs_awaiting_whatsapp_permission = AsyncMock(return_value=[run1])
+        # The conditional claim found the run no longer parked: another delivery
+        # of the same grant (webhook redelivery, messages webhook, cron sync)
+        # already activated it and already enqueued the batch.
+        mock_db.activate_queued_run_for_immediate_dial = AsyncMock(return_value=None)
+
+        mock_config_10 = MagicMock(id=10)
+        mock_db.get_whatsapp_configuration_by_phone_number_id = AsyncMock(return_value=mock_config_10)
+        mock_db.get_campaign_by_id = AsyncMock(
+            return_value=MagicMock(id=1, telephony_configuration_id=10, state="running")
+        )
+
+        with patch("api.tasks.arq.enqueue_job", new_callable=AsyncMock) as mock_enqueue, \
+             patch_permission_sync(db_client=mock_db):
+            count = await reactivate_campaign_runs_for_recipient(
+                phone_number="+15551234567",
+                status="granted_temporary",
+                phone_number_id="phone_num_10",
+            )
+
+            self.assertEqual(count, 0)
+            mock_enqueue.assert_not_called()
 
     @patch("api.services.telephony.providers.whatsapp.routes.db_client")
     async def test_webhook_empty_payload_requires_and_verifies_signature(self, mock_db):
@@ -1184,7 +1370,8 @@ class TestWhatsAppPermissionFixes(IsolatedAsyncioTestCase):
         from api.services.campaign.campaign_orchestrator import CampaignOrchestrator
         from api.db.models import CampaignModel
 
-        orchestrator = CampaignOrchestrator()
+        # CampaignOrchestrator takes the Redis client it publishes progress on.
+        orchestrator = CampaignOrchestrator(AsyncMock())
         campaign = MagicMock(spec=CampaignModel)
         campaign.id = 123
         campaign.last_activity_at = datetime.now(UTC) - timedelta(hours=2)
@@ -1200,7 +1387,7 @@ class TestWhatsAppPermissionFixes(IsolatedAsyncioTestCase):
         self.assertFalse(should_complete)
         mock_db.get_queued_runs_count.assert_awaited_with(campaign_id=123, states=["queued", "processing"])
 
-    @patch("api.services.telephony.providers.whatsapp.routes.sync_all_parked_whatsapp_permissions")
+    @patch(f"{PERMISSION_SYNC}.sync_all_parked_whatsapp_permissions")
     async def test_sweep_parked_whatsapp_permissions_cron(self, mock_sync):
         """Verify sweep_parked_whatsapp_permissions task invokes sync_all_parked_whatsapp_permissions."""
         from api.tasks.campaign_tasks import sweep_parked_whatsapp_permissions
@@ -1220,15 +1407,18 @@ class TestWhatsAppPermissionFixes(IsolatedAsyncioTestCase):
         client = TelephonyConfigurationClient()
         mock_session = AsyncMock()
 
-        # First query returns None (row doesn't exist yet)
+        # _select_permission_row reads scalars().all() - it orders by id and
+        # reports duplicates rather than taking an arbitrary first row - so the
+        # result mocks have to answer that call, not .first().
         first_result = MagicMock()
-        first_result.scalars().first.return_value = None
+        first_result.scalars.return_value.all.return_value = []
 
         # Second query (after race) returns existing row inserted by competitor
         existing_row = MagicMock(spec=WhatsAppCallPermissionModel)
         existing_row.status = "pending"
+        existing_row.id = 1
         second_result = MagicMock()
-        second_result.scalars().first.return_value = existing_row
+        second_result.scalars.return_value.all.return_value = [existing_row]
 
         mock_session.execute = AsyncMock(side_effect=[first_result, second_result])
         # First commit raises IntegrityError due to competitor commit

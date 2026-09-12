@@ -1,26 +1,4 @@
-import sys
 import unittest
-from unittest.mock import MagicMock
-
-if "fastapi" not in sys.modules:
-    fastapi_mock = MagicMock()
-    class HTTPException(Exception):
-        def __init__(self, status_code: int = 400, detail: str = ""):
-            self.status_code = status_code
-            self.detail = detail
-            super().__init__(detail)
-    fastapi_mock.HTTPException = HTTPException
-    fastapi_mock.Request = MagicMock()
-    sys.modules["fastapi"] = fastapi_mock
-
-if "starlette" not in sys.modules:
-    sys.modules["starlette"] = MagicMock()
-    sys.modules["starlette.responses"] = MagicMock()
-
-if "api.constants" not in sys.modules:
-    const_mock = MagicMock()
-    const_mock.COUNTRY_CODES = {"US": "1", "IN": "91", "GB": "44"}
-    sys.modules["api.constants"] = const_mock
 
 from api.utils.telephony_address import is_e164, normalize_telephony_address
 
@@ -34,6 +12,18 @@ class TestTelephonyAddress(unittest.TestCase):
         self.assertTrue(is_e164("+84912345678"))
         self.assertTrue(is_e164("+201012345678"))
         self.assertTrue(is_e164("+2348012345678"))
+
+    def test_is_e164_rejects_surrounding_whitespace(self):
+        """is_e164 must strictly reject surrounding whitespace rather than silently tolerating it."""
+        self.assertFalse(is_e164(" +14155552671"))
+        self.assertFalse(is_e164("+14155552671 "))
+        self.assertFalse(is_e164(" +14155552671 "))
+        self.assertFalse(is_e164("\t+14155552671\n"))
+
+    def test_is_e164_rejects_non_ascii_digits(self):
+        """E.164 requires ASCII 0-9 digits; non-ASCII decimal digits must be rejected."""
+        self.assertFalse(is_e164("+1١٢٣٤٥٦٧٨"))
+        self.assertFalse(is_e164("+91७५०५३२७४८२"))
 
     def test_is_e164_rejects_extra_plus_signs(self):
         """Numbers with duplicate or misplaced '+' must be rejected."""

@@ -159,6 +159,9 @@ export default function EditCampaignPage() {
                 }),
             ]);
 
+            if (defaultsRes.error) {
+                throw new Error(detailFromError(defaultsRes.error, 'Failed to load campaign defaults'));
+            }
             if (defaultsRes.data) {
                 setOrgConcurrentLimit(defaultsRes.data.concurrent_call_limit);
                 setFromNumbersCount(defaultsRes.data.from_numbers_count);

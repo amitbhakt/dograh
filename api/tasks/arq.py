@@ -75,16 +75,10 @@ from api.tasks.workflow_completion import process_workflow_completion
 async def startup(ctx):
     """Wire anything the worker needs before it can run a job.
 
-    The worker places outbound WhatsApp calls (campaign dispatch), so it needs
-    the voice pipeline runner registered. It never mounts HTTP routes, so
-    nothing would otherwise import the module that registers it, and a call
-    dispatched first would connect with no pipeline behind it.
+    Eagerly load telephony providers so provider registration runs via package
+    imports at worker startup.
     """
-    from api.services.telephony.providers.whatsapp.routes import (
-        install_whatsapp_pipeline_runner,
-    )
-
-    install_whatsapp_pipeline_runner()
+    import api.services.telephony  # noqa: F401
 
 
 class WorkerSettings:

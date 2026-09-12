@@ -531,6 +531,12 @@ class TestWhatsAppInboundCalling(IsolatedAsyncioTestCase):
         ), patch(
             "api.services.telephony.providers.whatsapp.routes._get_redis",
             AsyncMock(return_value=mock_redis),
+        ), patch(
+            # The terminate itself is handled in the service module, which
+            # resolves _get_redis from its own globals - patching only the
+            # routes name leaves this test talking to a real Redis.
+            "api.services.telephony.providers.whatsapp.service._get_redis",
+            AsyncMock(return_value=mock_redis),
         ), patch.object(
             db_client,
             "get_workflow_run_by_call_id",

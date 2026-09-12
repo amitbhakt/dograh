@@ -27,7 +27,10 @@ from api.db.models import (
 )
 from api.services.call_concurrency import CallConcurrencySlot
 from api.services.call_concurrency.rate_limiter import FromNumberAcquisition
-from api.services.campaign.campaign_call_dispatcher import CampaignCallDispatcher
+from api.services.campaign.campaign_call_dispatcher import (
+    CampaignCallDispatcher,
+    DispatchResult,
+)
 
 # =============================================================================
 # Test-specific fixtures
@@ -197,10 +200,12 @@ def mock_dispatch_call():
         # Simulate some processing time
         await asyncio.sleep(0.01)
         processed_runs.append(queued_run.id)
-        # Return a mock workflow run
+        # Return what the real dispatch_call returns: the run, plus whether it
+        # ended the queued run itself. A bare mock here would answer to any
+        # attribute and could not say "not finalized" truthfully.
         mock_run = MagicMock()
         mock_run.id = len(processed_runs)
-        return mock_run
+        return DispatchResult(mock_run)
 
     return mock_dispatch, processed_runs
 

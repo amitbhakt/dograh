@@ -1596,18 +1596,24 @@ async def update_phone_number(
     if request.telephony_trunk_id is not None:
         await _ensure_trunk_belongs_to_config(request.telephony_trunk_id, config_id)
 
-    row = await db_client.update_phone_number(
-        phone_number_id=phone_number_id,
-        telephony_configuration_id=config_id,
-        label=request.label,
-        inbound_workflow_id=request.inbound_workflow_id,
-        telephony_trunk_id=request.telephony_trunk_id,
-        is_active=request.is_active,
-        country_code=request.country_code,
-        extra_metadata=request.extra_metadata,
-        clear_inbound_workflow=request.clear_inbound_workflow,
-        clear_trunk=request.clear_trunk,
-    )
+    try:
+        row = await db_client.update_phone_number(
+            phone_number_id=phone_number_id,
+            telephony_configuration_id=config_id,
+            label=request.label,
+            inbound_workflow_id=request.inbound_workflow_id,
+            telephony_trunk_id=request.telephony_trunk_id,
+            is_active=request.is_active,
+            country_code=request.country_code,
+            extra_metadata=request.extra_metadata,
+            clear_inbound_workflow=request.clear_inbound_workflow,
+            clear_trunk=request.clear_trunk,
+        )
+    except TelephonyPhoneNumberConflictError:
+        raise HTTPException(
+            status_code=409,
+            detail="A phone number with this address or default caller ID already exists.",
+        )
     if not row:
         raise HTTPException(status_code=404, detail="Phone number not found")
 
@@ -1637,7 +1643,18 @@ async def set_default_caller_id(
         raise HTTPException(status_code=400, detail="No organization selected")
     await _ensure_config_belongs_to_org(config_id, user.selected_organization_id)
 
-    row = await db_client.set_default_caller_id(phone_number_id, config_id)
+    try:
+        row = await db_client.set_default_caller_id(phone_number_id, config_id)
+    except TelephonyPhoneNumberConflictError:
+        # Clearing the previous default and setting the new one are two
+        # statements: two requests promoting different numbers on the same
+        # configuration can interleave and race for
+        # uq_phone_numbers_default_caller. That is a caller-visible conflict,
+        # not a server fault - same 409 the update endpoint returns.
+        raise HTTPException(
+            status_code=409,
+            detail="A phone number with this address or default caller ID already exists.",
+        )
     if not row:
         raise HTTPException(status_code=404, detail="Phone number not found")
     return _phone_number_to_response(row)

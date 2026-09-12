@@ -23,11 +23,9 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 from api.constants import ENABLE_COTURN, FORCE_TURN_RELAY
 from api.db import db_client
 from api.enums import CallType, WorkflowRunMode
-from api.routes.turn_credentials import (
-    TURN_SECRET,
-    TurnCredentialsResponse,
-    generate_turn_credentials,
-)
+from api.constants import TURN_SECRET
+from api.routes.turn_credentials import TurnCredentialsResponse
+from api.services.turn import generate_turn_credentials
 from api.schemas.embed_chat import PublicEmbedChatSessionResponse
 from api.schemas.widget_texts import WidgetTexts
 from api.services.workflow.embed_chat_limiter import allow_embed_chat_init

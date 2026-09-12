@@ -548,39 +548,6 @@ async def get_campaign(
     )
 
 
-@router.post("/{campaign_id}/sync-whatsapp-permissions")
-async def sync_campaign_whatsapp_permissions(
-    campaign_id: int,
-    user: UserModel = Depends(get_user),
-) -> dict:
-    """Manually trigger WhatsApp call permission sync with Meta for parked leads in this campaign."""
-    campaign = await db_client.get_campaign(campaign_id, user.selected_organization_id)
-    if not campaign:
-        raise HTTPException(status_code=404, detail="Campaign not found")
-
-    from api.services.telephony.providers.whatsapp.routes import (
-        sync_whatsapp_permissions_for_campaign,
-    )
-
-    # force=False keeps the helper's 30s per-campaign cooldown: each sync costs
-    # one Meta Graph call per parked recipient, inline in this request, so
-    # repeated clicks would burn Meta rate limits and pin request workers.
-    #
-    # The helper owns that cooldown and reports whether it applied. Checking the
-    # key here instead would duplicate a protocol we do not own - two requests
-    # could both pass a read-only pre-check before either armed the key, and any
-    # change to the key or TTL would silently desynchronise the two copies.
-    result = await sync_whatsapp_permissions_for_campaign(campaign_id, force=False)
-    return {
-        "success": True,
-        "campaign_id": campaign_id,
-        "reactivated_count": result.reactivated,
-        # Distinguishes "skipped, try again shortly" from "asked Meta, nobody
-        # has granted permission yet" - both reactivate zero runs.
-        "throttled": result.throttled,
-    }
-
-
 @router.post("/{campaign_id}/start")
 async def start_campaign(
     campaign_id: int,
