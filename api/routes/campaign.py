@@ -562,17 +562,22 @@ async def sync_campaign_whatsapp_permissions(
         sync_whatsapp_permissions_for_campaign,
     )
 
-    # force=False keeps the helper's 30s per-campaign Redis cooldown. Each sync
-    # issues one Meta Graph API call per parked recipient inline in this request,
-    # so a forced sync let repeated clicks burn Meta rate limits and pin request
-    # workers. Within the cooldown the helper returns 0 immediately.
-    reactivated_count = await sync_whatsapp_permissions_for_campaign(
-        campaign_id, force=False
-    )
+    # force=False keeps the helper's 30s per-campaign cooldown: each sync costs
+    # one Meta Graph call per parked recipient, inline in this request, so
+    # repeated clicks would burn Meta rate limits and pin request workers.
+    #
+    # The helper owns that cooldown and reports whether it applied. Checking the
+    # key here instead would duplicate a protocol we do not own - two requests
+    # could both pass a read-only pre-check before either armed the key, and any
+    # change to the key or TTL would silently desynchronise the two copies.
+    result = await sync_whatsapp_permissions_for_campaign(campaign_id, force=False)
     return {
         "success": True,
         "campaign_id": campaign_id,
-        "reactivated_count": reactivated_count,
+        "reactivated_count": result.reactivated,
+        # Distinguishes "skipped, try again shortly" from "asked Meta, nobody
+        # has granted permission yet" - both reactivate zero runs.
+        "throttled": result.throttled,
     }
 
 

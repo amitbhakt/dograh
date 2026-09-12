@@ -53,8 +53,13 @@ class TestWhatsAppRestrictions(unittest.TestCase):
         self.assertTrue(is_restr)
         self.assertIn("United States and Canada", reason)
 
+        # Bare numbers are no longer classified here at all: a country code is
+        # now required upstream (campaign ingest via validate_source_data, and
+        # is_e164 on the test-call / public API routes), so this function never
+        # has to guess. "16502530000" is still never dialled - it is rejected at
+        # the edge instead of guessed at by leading digits.
         is_restr_no_plus, _ = is_restricted_country("16502530000")
-        self.assertTrue(is_restr_no_plus)
+        self.assertFalse(is_restr_no_plus)
 
         with self.assertRaises(HTTPException) as ctx:
             validate_destination_country("+14155552671")
@@ -107,6 +112,62 @@ class TestWhatsAppRestrictions(unittest.TestCase):
             self.assertIsNone(reason)
             # Should not raise
             validate_destination_country(number)
+
+    def test_bare_nanp_area_codes_not_confused_with_egypt_or_nigeria(self):
+        """Bare 10-digit NANP numbers must not be misread as Egypt/Nigeria."""
+        for number in ("2015551234", "2345551234"):
+            is_restr, reason = is_restricted_country(number)
+            self.assertFalse(is_restr, f"{number} should not be restricted")
+            self.assertIsNone(reason)
+
+    def test_malformed_plus_signs_do_not_bypass_restricted_numbers(self):
+        """A duplicated/misplaced '+' must not let a restricted number through.
+
+        The outbound dial path strips ALL non-digit characters (including
+        every '+') before dialling, so a stray extra '+' must not change
+        whether the number is classified as restricted.
+        """
+        for number in ("++201555123456", "+ +201555123456", "1+234555123456"):
+            is_restr, reason = is_restricted_country(number)
+            self.assertTrue(is_restr, f"{number} should be restricted")
+            self.assertIsNotNone(reason)
+
+    def test_bare_plus_only_input_is_not_restricted(self):
+        """Degenerate '+'/'++' input with no digits can't be classified."""
+        for number in ("+", "++"):
+            is_restr, reason = is_restricted_country(number)
+            self.assertFalse(is_restr)
+            self.assertIsNone(reason)
+
+    def test_bare_numbers_are_not_classified_at_all(self):
+        """Bare numbers no longer reach a verdict here - the country code is required upstream.
+
+        The collision this used to fail closed on is unresolvable: a bare
+        11-digit number starting with "1" is either a US number carrying its
+        country code or a Chinese mobile without one, and nothing in the digits
+        separates them. Rather than pick which way to be wrong, every path into
+        an outbound call now requires E.164 (validate_source_data at campaign
+        ingest; is_e164 on the test-call and public API routes), so the
+        ambiguous input never arrives.
+        """
+        for bare in ("16502530000", "13800138000", "2015551234", "2345551234"):
+            with self.subTest(number=bare):
+                is_restr, reason = is_restricted_country(bare)
+                self.assertFalse(is_restr)
+                self.assertIsNone(reason)
+
+    def test_malformed_plus_cannot_smuggle_a_restricted_destination(self):
+        """Extra "+" characters must not bypass the gate.
+
+        The dial path strips every non-digit and redials f"+{digits}", so a
+        number that would actually be placed to a restricted country has to be
+        caught here regardless of how its "+" is written.
+        """
+        for malformed in ("++201555123456", "+ +201555123456", "+20 1555 123456"):
+            with self.subTest(number=malformed):
+                is_restr, reason = is_restricted_country(malformed)
+                self.assertTrue(is_restr)
+                self.assertIn("Egypt", reason)
 
 
 if __name__ == "__main__":

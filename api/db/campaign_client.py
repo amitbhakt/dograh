@@ -577,6 +577,62 @@ class CampaignClient(BaseDBClient):
                 raise
             return attempt
 
+    async def mark_queued_run_processed_if_owned(self, queued_run_id: int) -> bool:
+        """Move a claimed run to ``processed``, only if this claim still owns it.
+
+        ``claim_queued_runs_for_processing`` leaves the row in ``processing``, so
+        that state is the claim ticket. A run that was parked and later granted
+        goes back to ``queued`` and can be claimed and completed by a different
+        batch; re-marking it here would rewrite another batch's ``processed_at``
+        and double count it. Returns True only when this call performed the
+        transition.
+        """
+        async with self.async_session() as session:
+            result = await session.execute(
+                update(QueuedRunModel)
+                .where(
+                    QueuedRunModel.id == queued_run_id,
+                    QueuedRunModel.state == "processing",
+                )
+                .values(state="processed", processed_at=datetime.now(UTC))
+                .execution_options(synchronize_session=False)
+            )
+            await session.commit()
+            return result.rowcount > 0
+
+    async def sync_campaign_processed_rows(self, campaign_id: int) -> int:
+        """Set processed_rows to the number of finished queued runs.
+
+        ``processed_rows`` is a cache of queued-run state, not an independent
+        fact, and three different writers used to maintain it by delta (batch
+        dispatch, permission denial, redial). Recomputing from the rows is
+        idempotent, so a retry, a duplicate webhook or an overlapping batch
+        cannot inflate campaign progress past the number of finished contacts.
+
+        The count and the write happen in one statement rather than a SELECT
+        followed by an UPDATE: with two statements, an atomic increment (e.g.
+        ``fail_queued_run_permission_denied``) landing between them would be
+        clobbered by the stale count this then writes back.
+        """
+        async with self.async_session() as session:
+            result = await session.execute(
+                text(
+                    "UPDATE campaigns SET "
+                    "processed_rows = ("
+                    "  SELECT count(*) FROM queued_runs "
+                    "  WHERE queued_runs.campaign_id = campaigns.id "
+                    "  AND queued_runs.state IN ('processed', 'failed')"
+                    "), "
+                    "updated_at = :now "
+                    "WHERE campaigns.id = :campaign_id "
+                    "RETURNING campaigns.processed_rows"
+                ),
+                {"campaign_id": campaign_id, "now": datetime.now(UTC)},
+            )
+            actual = result.scalar_one()
+            await session.commit()
+            return actual
+
     async def increment_campaign_processed_rows(
         self, campaign_id: int, delta: int = 1
     ) -> int:

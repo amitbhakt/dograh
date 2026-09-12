@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException
 from api.db import db_client
+from api.services.pipecat.call_gate import ANSWERED, OutboundCallGate
 
 
 class TestWhatsAppOutboundAnswerGating(IsolatedAsyncioTestCase):
@@ -47,7 +48,7 @@ class TestWhatsAppOutboundAnswerGating(IsolatedAsyncioTestCase):
         mock_audio_buffer = MagicMock()
         mock_audio_buffer.start_recording = AsyncMock()
 
-        call_answered_event = asyncio.Event()
+        call_answered_event = OutboundCallGate()
 
         with patch("api.services.pipecat.event_handlers.capture_event"):
             register_event_handlers(
@@ -82,7 +83,7 @@ class TestWhatsAppOutboundAnswerGating(IsolatedAsyncioTestCase):
             mock_engine.queue_node_opening.assert_not_called()
 
             # Now simulate recipient answering the call (Meta sends status: ACCEPTED)
-            call_answered_event.set()
+            call_answered_event.resolve(ANSWERED)
             await asyncio.wait_for(conn_task, timeout=1.0)
 
             # Now recording and greeting must have been triggered
@@ -155,7 +156,7 @@ class TestWhatsAppWebRTCAnswerDecoupling(IsolatedAsyncioTestCase):
         )
 
         call_id = "test_call_sdp_only"
-        answered_event = asyncio.Event()
+        answered_event = OutboundCallGate()
         _outbound_answered_events[call_id] = answered_event
 
         mock_conn = MagicMock()
@@ -196,7 +197,7 @@ class TestWhatsAppWebRTCAnswerDecoupling(IsolatedAsyncioTestCase):
         )
 
         call_id = "test_call_accepted"
-        answered_event = asyncio.Event()
+        answered_event = OutboundCallGate()
         _outbound_answered_events[call_id] = answered_event
 
         mock_conn = MagicMock()

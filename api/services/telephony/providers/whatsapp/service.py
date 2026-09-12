@@ -7,6 +7,7 @@ from HTTP router handlers.
 
 import asyncio
 import json
+from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import aiohttp
@@ -21,6 +22,9 @@ from api.constants import (
     TURN_PORT,
     TURN_SECRET,
 )
+from api.db import db_client
+from api.enums import WorkflowRunState
+from api.services.call_concurrency import call_concurrency
 from api.services.pipecat.call_gate import ANSWERED, TERMINATED, OutboundCallGate
 from api.services.turn import generate_turn_credentials
 from pipecat.transports.smallwebrtc.connection import IceServer, SmallWebRTCConnection
@@ -247,6 +251,41 @@ async def listen_for_remote_events() -> None:
                                         f"[WhatsApp] Unblocking pipeline for cross-worker answered call {target_call_id}"
                                     )
                                     answered_evt.resolve(ANSWERED)
+
+                                # The webhook worker's local _handle_call_accepted
+                                # only runs its state-update block when it owns the
+                                # connection, so on a cross-worker delivery nothing
+                                # ever marks the call answered: call_status/
+                                # connected_at stay unset here, and the shared
+                                # call-status endpoint (resolve_live_call_state
+                                # below) reads exactly those fields to report
+                                # "answered". Mirror that update on this, the
+                                # owning, worker.
+                                accept_entry = _active_connections.get(target_call_id)
+                                if accept_entry:
+                                    accept_conn, accept_run_id = accept_entry[0], accept_entry[1]
+                                    if hasattr(accept_conn, "call_status"):
+                                        accept_conn.call_status = "in-progress"
+                                    now_iso = datetime.now(timezone.utc).isoformat()
+                                    if hasattr(accept_conn, "connected_at") and not accept_conn.connected_at:
+                                        accept_conn.connected_at = now_iso
+                                    try:
+                                        run = await db_client.get_workflow_run(accept_run_id)
+                                        if run:
+                                            ctx = dict(run.gathered_context or {})
+                                            ctx["call_status"] = "in-progress"
+                                            if not ctx.get("connected_at"):
+                                                ctx["connected_at"] = now_iso
+                                            await db_client.update_workflow_run(
+                                                accept_run_id,
+                                                state=WorkflowRunState.RUNNING.value,
+                                                gathered_context=ctx,
+                                            )
+                                    except Exception as e:
+                                        logger.warning(
+                                            f"[WhatsApp] Failed to update workflow run on "
+                                            f"cross-worker accepted for {target_call_id}: {e}"
+                                        )
                 except Exception as parse_err:
                     logger.warning(f"[WhatsApp] Error handling cross-worker message: {parse_err}")
         except asyncio.CancelledError:
@@ -366,3 +405,287 @@ _get_or_create_whatsapp_client = get_or_create_whatsapp_client
 _get_redis = get_whatsapp_redis
 _ensure_redis_subscriber = ensure_redis_subscriber
 _listen_for_remote_events = listen_for_remote_events
+
+
+async def handle_call_terminate(
+    call_data: Dict[str, Any],
+    payload: Dict[str, Any],
+    *,
+    provider_termination_unconfirmed: bool = False,
+) -> None:
+    """Handle a WhatsApp call termination event from Meta.
+
+    ``provider_termination_unconfirmed`` marks the case where we are tearing
+    down without Meta having acknowledged the hangup. Resources we own (peer
+    connection, pipeline, concurrency slot) still come down - leaving a pipeline
+    running against a call nobody is watching is strictly worse - but the Redis
+    recovery key is left in place so the call can still be identified and the
+    hangup re-issued. The durable stamp on the run is written by
+    ``terminate_whatsapp_call_by_id``, not here: this block only executes on the
+    worker that owns the connection, so a cross-worker terminate would otherwise
+    lose it.
+
+    Lives in the service layer (not routes.py) so provider.py's ``end_call`` can
+    call it without a call-time import back into the HTTP route module - see
+    ``WhatsAppProvider.end_call``.
+    """
+    call_id = call_data.get("id") or ""
+    if not call_id:
+        return
+    logger.info(f"[WhatsApp] Processing terminate event for call {call_id}")
+
+    # Broadcast terminate to owning worker via Redis pub/sub and delete call key
+    try:
+        redis = await _get_redis()
+        if redis:
+            if not provider_termination_unconfirmed:
+                await redis.delete(f"{WHATSAPP_CALL_KEY_PREFIX}{call_id}")
+            await redis.publish(
+                REDIS_TERMINATE_CHANNEL,
+                json.dumps({"call_id": call_id}),
+            )
+    except Exception as e:
+        logger.warning(f"[WhatsApp] Failed to publish terminate to Redis: {e}")
+
+    answered_evt = _outbound_answered_events.pop(call_id, None)
+    if answered_evt:
+        answered_evt.resolve(TERMINATED)
+
+    entry = _active_connections.pop(call_id, None)
+    if entry:
+        connection, workflow_run_id, org_id = entry[:3]
+        try:
+            await connection.disconnect()
+            logger.info(f"[WhatsApp] Peer connection closed for call {call_id}")
+        except Exception as e:
+            logger.warning(f"[WhatsApp] Error during peer connection disconnect: {e}")
+
+        # Mark workflow run state if still running
+        try:
+            errors = call_data.get("errors") or []
+            err_msg = None
+            if errors and isinstance(errors, list) and len(errors) > 0:
+                err_msg = errors[0].get("title") or errors[0].get("message")
+            run = await db_client.get_workflow_run(workflow_run_id)
+            ctx = dict(run.gathered_context or {}) if run else {}
+            ctx["call_status"] = "failed" if err_msg else "completed"
+            ctx["ended_at"] = datetime.now(timezone.utc).isoformat()
+            if err_msg:
+                ctx["error"] = err_msg
+            await db_client.update_workflow_run(
+                workflow_run_id,
+                is_completed=True,
+                state=WorkflowRunState.COMPLETED.value,
+                gathered_context=ctx,
+            )
+        except Exception as e:
+            logger.warning(f"[WhatsApp] Failed to update workflow run on termination: {e}")
+
+        try:
+            await call_concurrency.release_workflow_run_slot(workflow_run_id)
+        except Exception as e:
+            logger.warning(
+                f"[WhatsApp] Failed to release concurrency slot on terminate for {workflow_run_id}: {e}"
+            )
+    else:
+        # Cross-worker termination cleanup: when webhook hits a different worker instance
+        try:
+            run = await db_client.get_workflow_run_by_call_id(call_id)
+            if run and not run.is_completed:
+                logger.info(
+                    f"[WhatsApp] Cleaning up cross-worker workflow run {run.id} for terminated call {call_id}"
+                )
+                errors = call_data.get("errors") or []
+                err_msg = None
+                if errors and isinstance(errors, list) and len(errors) > 0:
+                    err_msg = errors[0].get("title") or errors[0].get("message")
+                ctx = dict(run.gathered_context or {})
+                ctx["call_status"] = "failed" if err_msg else "completed"
+                ctx["ended_at"] = datetime.now(timezone.utc).isoformat()
+                if err_msg:
+                    ctx["error"] = err_msg
+                await db_client.update_workflow_run(
+                    run.id,
+                    is_completed=True,
+                    state=WorkflowRunState.COMPLETED.value,
+                    gathered_context=ctx,
+                )
+                await call_concurrency.release_workflow_run_slot(run.id)
+        except Exception as e:
+            logger.warning(
+                f"[WhatsApp] Failed cross-worker terminate cleanup for call {call_id}: {e}"
+            )
+
+
+async def terminate_whatsapp_call_by_id(
+    call_id: str,
+    workflow_run_id: Optional[int] = None,
+    organization_id: Optional[int] = None,
+) -> bool:
+    """Terminate an active WhatsApp call locally and via Meta Graph API."""
+    answered_evt = _outbound_answered_events.pop(call_id, None)
+    if answered_evt:
+        answered_evt.resolve(TERMINATED)
+
+    phone_number_id = None
+    entry = _active_connections.get(call_id)
+    if entry:
+        phone_number_id = entry[3]
+        if not workflow_run_id:
+            workflow_run_id = entry[1]
+    elif call_id:
+        try:
+            redis = await _get_redis()
+            if redis:
+                raw_data = await redis.get(f"{WHATSAPP_CALL_KEY_PREFIX}{call_id}")
+                if raw_data:
+                    data = json.loads(raw_data)
+                    phone_number_id = data.get("phone_number_id")
+                    if not workflow_run_id:
+                        workflow_run_id = data.get("workflow_run_id")
+        except Exception as e:
+            logger.warning(f"[WhatsApp] Redis lookup error during termination: {e}")
+
+    # Fallback to workflow run gathered_context
+    if not phone_number_id and workflow_run_id:
+        try:
+            run = await db_client.get_workflow_run(workflow_run_id)
+            if run:
+                ctx = run.gathered_context or {}
+                phone_number_id = ctx.get("from_phone_number_id") or ctx.get("phone_number_id")
+                if not organization_id:
+                    organization_id = run.organization_id
+        except Exception:
+            pass
+
+    # 1. Ask Meta Graph API to terminate the call on user device.
+    # Tracked separately from the local teardown below: if Meta never confirms,
+    # the recipient's leg may still be up, and the caller must not be told the
+    # hang-up succeeded.
+    provider_terminated = False
+    try:
+        config = None
+        if phone_number_id:
+            config = await db_client.get_whatsapp_configuration_by_phone_number_id(
+                str(phone_number_id)
+            )
+        if not config and organization_id:
+            # Org-scoped: list_active_telephony_configurations_by_provider is
+            # cross-org and takes only `provider`, so the previous call both
+            # raised TypeError (swallowed by the except below, which is why this
+            # fallback never once worked) and would have reached another
+            # tenant's credentials if it had.
+            configs = await db_client.list_telephony_configurations_by_provider(
+                organization_id, "whatsapp"
+            )
+            config = configs[0] if configs else None
+
+        if config:
+            creds = config.credentials or {}
+            access_token = creds.get("access_token") or creds.get("api_key")
+            app_secret = creds.get("app_secret")
+            config_phone_number_id = str(creds.get("phone_number_id") or phone_number_id or "")
+            if access_token and config_phone_number_id:
+                client = _get_or_create_whatsapp_client(
+                    config_phone_number_id, access_token, app_secret
+                )
+                if client and client._whatsapp_api:
+                    resp = await client._whatsapp_api.terminate_call_to_whatsapp(call_id)
+                    provider_terminated = True
+                    logger.info(
+                        f"[WhatsApp] Sent terminate request to Meta API for call {call_id}: resp={resp}"
+                    )
+                else:
+                    logger.warning(
+                        f"[WhatsApp] Cannot terminate call {call_id} at Meta: no API client"
+                    )
+            else:
+                logger.warning(
+                    f"[WhatsApp] Cannot terminate call {call_id}: missing access_token or phone_number_id"
+                )
+        else:
+            logger.warning(
+                f"[WhatsApp] Cannot terminate call {call_id}: no active WhatsApp configuration found"
+            )
+    except Exception as e:
+        logger.warning(f"[WhatsApp] Meta Graph API termination failed: {e}")
+
+    # 2. Tear down locally. This runs even when Meta did not confirm: dropping
+    # our peer usually ends the call anyway, and leaving a pipeline and a
+    # concurrency slot held for a call nobody can observe is worse. What we do
+    # NOT do in that case is discard the call's identity - see
+    # provider_termination_unconfirmed, which keeps the Redis recovery key and
+    # stamps the run so the hangup can be re-issued against the same call.
+    await handle_call_terminate(
+        {"id": call_id},
+        {},
+        provider_termination_unconfirmed=not provider_terminated,
+    )
+
+    if not provider_terminated:
+        logger.error(
+            f"[WhatsApp] Local teardown for call {call_id} completed, but Meta never "
+            "confirmed termination; the recipient's leg may still be connected."
+        )
+
+    # Stamp the run here rather than inside the teardown: this runs on whichever
+    # worker handled the request, owning the connection or not, so the durable
+    # record of an unconfirmed hangup survives a cross-worker terminate. Also
+    # clears the stamp when a retry finally succeeds - that retry has no active
+    # connection left, so the teardown's run update is skipped entirely.
+    if workflow_run_id:
+        try:
+            run = await db_client.get_workflow_run(workflow_run_id)
+            ctx = dict(run.gathered_context or {}) if run else {}
+            if ctx.get("provider_termination_unconfirmed") != (not provider_terminated):
+                ctx["provider_termination_unconfirmed"] = not provider_terminated
+                await db_client.update_workflow_run(
+                    workflow_run_id, gathered_context=ctx
+                )
+        except Exception as e:
+            logger.warning(
+                f"[WhatsApp] Failed recording termination-confirmation state for "
+                f"run {workflow_run_id}: {e}"
+            )
+    return provider_terminated
+
+
+# Aliases for backwards compatibility with existing private names used by
+# routes.py. routes.py imports and re-exports these under their original
+# module-level names (``_handle_call_terminate``, ``terminate_whatsapp_call_by_id``)
+# so existing callers and any test that patches ``routes.terminate_whatsapp_call_by_id``
+# or ``routes._handle_call_terminate`` keep working unchanged.
+_handle_call_terminate = handle_call_terminate
+
+
+def resolve_live_call_state(call_id, workflow_run_id):
+    """Report this worker's in-memory view of a WhatsApp call.
+
+    Pure and synchronous by contract (ProviderSpec.live_call_state_resolver):
+    the call-status endpoint polls it once a second, so it touches only the
+    active-connection registry. ``answered`` comes from the connection's
+    call_status, which Meta's ACCEPTED webhook sets - the peer connects during
+    dialling, so being connected is not the same as being answered.
+    """
+    from api.services.telephony.registry import LiveCallState
+
+    entry = _active_connections.get(call_id) if call_id else None
+    if entry is None:
+        for cid, candidate in _active_connections.items():
+            if candidate[1] == workflow_run_id:
+                call_id, entry = cid, candidate
+                break
+    if entry is None:
+        return None
+
+    connection = entry[0]
+    try:
+        peer_connected = bool(connection.is_connected())
+    except Exception:
+        peer_connected = False
+
+    return LiveCallState(
+        call_id=call_id,
+        peer_connected=peer_connected,
+        answered=getattr(connection, "call_status", None) == "in-progress",
+    )

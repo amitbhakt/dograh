@@ -28,15 +28,6 @@ RESTRICTED_BIC_PREFIXES = {
 }
 
 
-# Numbers stripped down to only digits (and a leading "+" if present) shorter
-# than this can't carry an explicit country code on top of a plausible
-# national number, so their leading digits are never checked against a
-# restricted dial code when there is no "+". This is exactly the length of a
-# bare NANP number (area code + local number, no country code) -- the case
-# that was previously misread as Egypt (+20) or Nigeria (+234) for numbers
-# such as "2015551234" or "2345551234".
-_MIN_BARE_INTERNATIONAL_LENGTH = 11
-
 _NON_DIAL_CHARS_RE = re.compile(r"[^\d+]")
 
 
@@ -48,47 +39,46 @@ def _restricted_reason(name: str) -> str:
 
 
 def is_restricted_country(phone_number: str) -> Tuple[bool, Optional[str]]:
-    """Check if the given phone number falls into Meta's restricted BIC countries.
+    """Check whether a number is in one of Meta's restricted BIC countries.
 
-    Only numbers that genuinely carry an explicit country code are matched:
-    either an E.164 "+" prefix, or -- absent a "+" -- a bare digit string long
-    enough that it could not plausibly be a domestic number in an unrelated,
-    shorter numbering plan (see `_MIN_BARE_INTERNATIONAL_LENGTH`).
+    Classifies only numbers that state their country, i.e. E.164 with a leading
+    "+". Every path that reaches an outbound call now guarantees that:
+    campaign leads are rejected at ingest without one (``validate_source_data``),
+    and the test-call and public API routes enforce ``is_e164`` on the resolved
+    number. So a bare number never arrives here, and this does not try to infer
+    a country from one.
 
-    A bare number that is too short to disambiguate (e.g. a 10-digit NANP
-    local number) is deliberately treated as NOT restricted (fail-open for
-    that ambiguous case) rather than blocked outright: failing closed would
-    reject legitimate domestic calls to non-restricted countries whenever a
-    lead's number happens to be stored without a country code, which is the
-    common case for US-only data. The tradeoff is that a genuinely restricted
-    number entered without its country code slips through this check; that
-    residual risk is a Meta BIC compliance exposure, not a correctness bug in
-    the numbers this function *can* classify.
+    That inference used to live here and could not be made correct. A bare
+    11-digit number starting with "1" is either a US number carrying its country
+    code or a Chinese mobile without one, and nothing in the digits separates
+    them - so the rule either blocked legitimate Chinese calls or let US calls
+    through. Requiring the country code upstream removes the ambiguity instead
+    of choosing which way to be wrong.
+
+    A "+" anywhere in the input (``"++20..."``, ``"+ +20..."``) still counts:
+    all "+" are dropped and one canonical leading "+" is re-added before
+    matching. This mirrors the dial path, which strips every non-digit and
+    redials ``f"+{digits}"`` - so a malformed extra "+" cannot smuggle a
+    restricted destination past this gate.
 
     Returns:
         Tuple of (is_restricted: bool, reason: Optional[str])
     """
-    clean = phone_number.strip()
-    if not clean:
+    stripped = _NON_DIAL_CHARS_RE.sub("", phone_number.strip())
+    if "+" not in stripped:
+        # No country code: not classifiable, and by the invariant above this
+        # should not reach a dial path. Nothing to assert about it here.
         return False, None
 
-    normalized = _NON_DIAL_CHARS_RE.sub("", clean)
-    if not normalized:
+    digits_only = stripped.replace("+", "")
+    if not digits_only:
+        # "+" or "++" alone.
         return False, None
 
+    canonical = "+" + digits_only
     for prefix, name in RESTRICTED_BIC_PREFIXES.items():
-        if normalized.startswith(prefix):
+        if canonical.startswith(prefix):
             return True, _restricted_reason(name)
-
-    if normalized.startswith("+"):
-        # Explicit country code present but it didn't match a restricted one.
-        return False, None
-
-    if len(normalized) > _MIN_BARE_INTERNATIONAL_LENGTH - 1:
-        for prefix, name in RESTRICTED_BIC_PREFIXES.items():
-            if normalized.startswith(prefix.lstrip("+")):
-                return True, _restricted_reason(name)
-
     return False, None
 
 

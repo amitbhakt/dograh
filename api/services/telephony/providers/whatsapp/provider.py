@@ -493,9 +493,7 @@ class WhatsAppProvider(TelephonyProvider):
         self, call_id: str, workflow_run_id: int, organization_id: int
     ) -> bool:
         """Terminate a live WhatsApp call at Meta and tear down local state."""
-        # Imported at call time: routes.py imports this package at module scope,
-        # so a top-level import here would close the cycle.
-        from api.services.telephony.providers.whatsapp.routes import (
+        from api.services.telephony.providers.whatsapp.service import (
             terminate_whatsapp_call_by_id,
         )
 

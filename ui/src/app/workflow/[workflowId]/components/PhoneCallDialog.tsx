@@ -285,6 +285,10 @@ export const PhoneCallDialog = ({
         waPermissionStatus === "granted" && waPermissionFor === waPermissionKey;
 
     const callIsActive = callStatus === "calling" || callStatus === "connected";
+    // Also true once /end-call comes back 200 with the provider unconfirmed:
+    // the run is closed on our side, but the carrier leg may still be live,
+    // and End Call is the only control that can re-issue the hangup.
+    const dismissalBlocked = callIsActive || providerHangupUnconfirmed;
 
     /**
      * Single gate for every way this dialog can be dismissed.
@@ -295,12 +299,15 @@ export const PhoneCallDialog = ({
      * a click on the overlay and the corner X all reach us through Radix's
      * `onOpenChange`, so honouring that same rule here (rather than clearing
      * state on close) keeps the one escape hatch consistent instead of adding
-     * a second, silent one that strands the call on the provider.
+     * a second, silent one that strands the call on the provider. The same
+     * applies while `providerHangupUnconfirmed` is set: the dialog closing
+     * (or "Call Again" resetting it) is just as capable of stranding the call
+     * as closing it mid-ring, so it gates every dismissal path here too.
      *
      * Returns whether the dialog actually closed.
      */
     const requestClose = useCallback(() => {
-        if (callIsActive) {
+        if (dismissalBlocked) {
             setCallError(
                 "End the call before closing. Closing now would leave the call running on the provider with no way to hang it up from here.",
             );
@@ -308,7 +315,7 @@ export const PhoneCallDialog = ({
         }
         onOpenChange(false);
         return true;
-    }, [callIsActive, onOpenChange]);
+    }, [dismissalBlocked, onOpenChange]);
 
     const nonSipConfigs = telephonyConfigs.filter(
         (config) => config.connectivity !== "sip" && !config.inactive,
@@ -567,7 +574,14 @@ export const PhoneCallDialog = ({
         if (!activeRunId) return;
         setEndingCall(true);
         setCallError(null);
-        setProviderHangupUnconfirmed(false);
+        // Do NOT clear providerHangupUnconfirmed here. It is the flag that
+        // keeps this dialog un-dismissable and the End Call button visible
+        // after a prior partial hangup; a retry that later throws (network
+        // error, timeout) must leave it exactly as it was, not reset to
+        // false, or the button disappears and the carrier leg is stranded
+        // with no way to re-issue the hangup. The success path below is the
+        // only place allowed to change it, since only a fresh response can
+        // tell us the provider's actual state.
         try {
             const token = await getAccessToken();
             const headers: Record<string, string> = {
@@ -1239,9 +1253,9 @@ export const PhoneCallDialog = ({
             <DialogFooter className="flex-col sm:flex-row gap-2">
                 <Button
                     variant="outline"
-                    disabled={callIsActive}
+                    disabled={dismissalBlocked}
                     title={
-                        callIsActive
+                        dismissalBlocked
                             ? "End the call before leaving this dialog"
                             : undefined
                     }
@@ -1295,7 +1309,12 @@ export const PhoneCallDialog = ({
                             <Button
                                 variant="outline"
                                 onClick={handleResetCall}
-                                disabled={callStatus === "calling" || callStatus === "connected"}
+                                disabled={dismissalBlocked}
+                                title={
+                                    dismissalBlocked
+                                        ? "End the call before starting a new one"
+                                        : undefined
+                                }
                             >
                                 Call Again
                             </Button>

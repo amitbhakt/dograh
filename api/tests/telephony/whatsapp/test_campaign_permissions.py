@@ -20,6 +20,7 @@ from unittest import IsolatedAsyncioTestCase
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from api.enums import TelephonyCallStatus, WorkflowRunState
+from api.services.call_concurrency.rate_limiter import FromNumberAcquisition
 from api.services.telephony.providers.whatsapp.provider import (
     WhatsAppPermissionRequiredError,
     WhatsAppProvider,
@@ -107,7 +108,7 @@ class TestWhatsAppCampaignDispatcher(IsolatedAsyncioTestCase):
         )
 
         with patch.object(dispatcher, "get_provider_for_campaign", return_value=mock_provider), \
-             patch.object(dispatcher, "acquire_from_number", return_value="15551882279"), \
+             patch.object(dispatcher, "acquire_from_number_with_token", return_value=FromNumberAcquisition("15551882279", "1700000000.0")), \
              patch.object(dispatcher, "release_call_slot", new_callable=AsyncMock), \
              patch("api.services.campaign.campaign_call_dispatcher.call_concurrency") as mock_concurrency, \
              patch("api.services.campaign.campaign_call_dispatcher.rate_limiter") as mock_rate_limiter, \
@@ -169,7 +170,7 @@ class TestWhatsAppCampaignDispatcher(IsolatedAsyncioTestCase):
         )
 
         with patch.object(dispatcher, "get_provider_for_campaign", return_value=mock_provider), \
-             patch.object(dispatcher, "acquire_from_number", return_value="15551882279"), \
+             patch.object(dispatcher, "acquire_from_number_with_token", return_value=FromNumberAcquisition("15551882279", "1700000000.0")), \
              patch.object(dispatcher, "release_call_slot", new_callable=AsyncMock) as mock_release_slot, \
              patch("api.services.campaign.campaign_call_dispatcher.call_concurrency") as mock_concurrency, \
              patch("api.services.campaign.campaign_call_dispatcher.rate_limiter") as mock_rate_limiter, \
@@ -248,7 +249,7 @@ class TestWhatsAppCampaignDispatcher(IsolatedAsyncioTestCase):
         )
 
         with patch.object(dispatcher, "get_provider_for_campaign", return_value=mock_provider), \
-             patch.object(dispatcher, "acquire_from_number", return_value="15551882279"), \
+             patch.object(dispatcher, "acquire_from_number_with_token", return_value=FromNumberAcquisition("15551882279", "1700000000.0")), \
              patch.object(dispatcher, "release_call_slot", new_callable=AsyncMock), \
              patch("api.services.campaign.campaign_call_dispatcher.call_concurrency") as mock_concurrency, \
              patch("api.services.campaign.campaign_call_dispatcher.rate_limiter") as mock_rate_limiter, \
@@ -313,7 +314,7 @@ class TestWhatsAppCampaignDispatcher(IsolatedAsyncioTestCase):
         )
 
         with patch.object(dispatcher, "get_provider_for_campaign", return_value=mock_provider), \
-             patch.object(dispatcher, "acquire_from_number", return_value="15551882279"), \
+             patch.object(dispatcher, "acquire_from_number_with_token", return_value=FromNumberAcquisition("15551882279", "1700000000.0")), \
              patch.object(dispatcher, "release_call_slot", new_callable=AsyncMock), \
              patch("api.services.campaign.campaign_call_dispatcher.call_concurrency") as mock_concurrency, \
              patch("api.services.campaign.campaign_call_dispatcher.rate_limiter") as mock_rate_limiter, \
@@ -361,7 +362,7 @@ class TestWhatsAppCampaignDispatcher(IsolatedAsyncioTestCase):
         mock_provider.initiate_call = AsyncMock(return_value=MagicMock(call_id="wa_call_123", provider_metadata={}))
 
         with patch.object(dispatcher, "get_provider_for_campaign", return_value=mock_provider), \
-             patch.object(dispatcher, "acquire_from_number", return_value="15551882279"), \
+             patch.object(dispatcher, "acquire_from_number_with_token", return_value=FromNumberAcquisition("15551882279", "1700000000.0")), \
              patch("api.services.campaign.campaign_call_dispatcher.call_concurrency") as mock_concurrency, \
              patch("api.services.campaign.campaign_call_dispatcher.rate_limiter") as mock_rate_limiter, \
              patch("api.services.campaign.campaign_call_dispatcher.authorize_workflow_run_start", return_value=MagicMock(has_quota=True)):
@@ -419,7 +420,7 @@ class TestWhatsAppCampaignDispatcher(IsolatedAsyncioTestCase):
         )
 
         with patch.object(dispatcher, "get_provider_for_campaign", return_value=mock_provider), \
-             patch.object(dispatcher, "acquire_from_number", return_value="15551882279"), \
+             patch.object(dispatcher, "acquire_from_number_with_token", return_value=FromNumberAcquisition("15551882279", "1700000000.0")), \
              patch.object(dispatcher, "release_call_slot", new_callable=AsyncMock), \
              patch("api.services.campaign.campaign_call_dispatcher.call_concurrency") as mock_concurrency, \
              patch("api.services.campaign.campaign_call_dispatcher.rate_limiter") as mock_rate_limiter, \
@@ -801,12 +802,36 @@ class TestWhatsAppWebhookReactiveTrigger(IsolatedAsyncioTestCase):
         mock_get_client.return_value = mock_client
 
         with patch("api.tasks.arq.enqueue_job", new_callable=AsyncMock) as mock_enqueue:
-            reactivated = await sync_whatsapp_permissions_for_campaign(20, force=True)
+            result = await sync_whatsapp_permissions_for_campaign(20, force=True)
 
-            self.assertEqual(reactivated, 1)
+            # The helper now reports throttling alongside the count so a caller
+            # can tell "cooldown skipped this" from "Meta said nobody granted".
+            self.assertEqual(result.reactivated, 1)
+            self.assertFalse(result.throttled)
             mock_client.check_call_permission.assert_called_once_with("917505327482")
             mock_db.activate_queued_run_for_immediate_dial.assert_called_once_with(101)
             mock_enqueue.assert_called_once_with("process_campaign_batch", 20, 10)
+
+    @patch("api.services.telephony.providers.whatsapp.routes._get_redis", new_callable=AsyncMock)
+    @patch("api.services.telephony.providers.whatsapp.routes.db_client")
+    async def test_sync_whatsapp_permissions_for_campaign_does_not_arm_cooldown_when_no_work(
+        self, mock_db, mock_get_redis
+    ):
+        """sync_whatsapp_permissions_for_campaign does not claim or arm Redis cooldown when there are no parked runs."""
+        from api.services.telephony.providers.whatsapp.routes import sync_whatsapp_permissions_for_campaign
+
+        mock_redis = AsyncMock()
+        mock_get_redis.return_value = mock_redis
+
+        # No parked runs
+        mock_db.get_all_queued_runs_awaiting_whatsapp_permission = AsyncMock(return_value=[])
+
+        result = await sync_whatsapp_permissions_for_campaign(20, force=False)
+
+        self.assertEqual(result.reactivated, 0)
+        self.assertFalse(result.throttled)
+        # Cooldown must NOT have been armed
+        mock_redis.set.assert_not_called()
 
 
 class TestWhatsAppPermissionFixes(IsolatedAsyncioTestCase):
@@ -1141,11 +1166,16 @@ class TestWhatsAppPermissionFixes(IsolatedAsyncioTestCase):
         self.assertEqual(resp, {"status": "success"})
 
     def test_acquire_from_number_default_timeout(self):
-        """Verify CampaignCallDispatcher.acquire_from_number default timeout is 600 seconds."""
+        """Verify the from_number acquisition default timeout is 600 seconds.
+
+        Asserts against the token-returning variant, which is the one dispatch
+        actually uses; the non-token sibling was removed rather than left as a
+        second, unreachable copy of the same retry loop.
+        """
         import inspect
         from api.services.campaign.campaign_call_dispatcher import CampaignCallDispatcher
 
-        sig = inspect.signature(CampaignCallDispatcher.acquire_from_number)
+        sig = inspect.signature(CampaignCallDispatcher.acquire_from_number_with_token)
         self.assertEqual(sig.parameters["timeout"].default, 600.0)
 
     @patch("api.services.campaign.campaign_orchestrator.db_client")

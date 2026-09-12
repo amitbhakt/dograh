@@ -460,10 +460,13 @@ class WhatsAppCallPermissionModel(Base):
         Index("ix_whatsapp_perm_lookup", "phone_number_id", "recipient_phone_number"),
         # Every permission-message status/reply webhook resolves the row by the
         # Meta message id alone, so without this the callback scans the table.
-        # meta_message_id is only populated while a request is outstanding, so a
-        # partial index keeps it to the small pending slice. Deliberately not
-        # unique: correctness of the webhook path must not depend on Meta never
-        # replaying a wamid across rows.
+        # meta_message_id is set once an outbound permission-request message is
+        # sent and nothing ever clears it afterward, so this does not track only
+        # "outstanding" requests -- granted/denied/expired rows stay indexed too.
+        # The partial predicate only excludes rows that never had a message id
+        # attached in the first place. Deliberately not unique: correctness of
+        # the webhook path must not depend on Meta never replaying a wamid
+        # across rows.
         Index(
             "ix_whatsapp_perm_meta_message_id",
             "meta_message_id",

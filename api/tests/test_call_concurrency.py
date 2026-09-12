@@ -417,11 +417,13 @@ async def test_release_workflow_run_slot_releases_from_number_mapping():
         mock_rate_limiter.release_concurrent_slot = AsyncMock(return_value=True)
         mock_rate_limiter.delete_workflow_slot_mapping = AsyncMock()
 
-        # From number mapping exists
-        mock_rate_limiter.get_workflow_from_number_mapping = AsyncMock(
-            return_value=(1, "+15551234567", 42)
+        # From number mapping exists. The 4th element is the ownership token -
+        # the acquisition score - which the release must present so it can only
+        # ever free its own acquisition, never one someone else has since taken.
+        mock_rate_limiter.get_workflow_from_number_mapping_with_token = AsyncMock(
+            return_value=(1, "+15551234567", 42, "1700000000.0")
         )
-        mock_rate_limiter.release_from_number = AsyncMock()
+        mock_rate_limiter.release_from_number = AsyncMock(return_value=True)
         mock_rate_limiter.delete_workflow_from_number_mapping = AsyncMock()
 
         res = await service.release_workflow_run_slot(workflow_run_id)
@@ -430,7 +432,8 @@ async def test_release_workflow_run_slot_releases_from_number_mapping():
         mock_rate_limiter.release_concurrent_slot.assert_awaited_once_with(1, "slot-abc", scope_key=None)
         mock_rate_limiter.delete_workflow_slot_mapping.assert_awaited_once_with(workflow_run_id)
         mock_rate_limiter.release_from_number.assert_awaited_once_with(
-            1, "+15551234567", telephony_configuration_id=42
+            1, "+15551234567", telephony_configuration_id=42,
+            expected_token="1700000000.0",
         )
         mock_rate_limiter.delete_workflow_from_number_mapping.assert_awaited_once_with(workflow_run_id)
 

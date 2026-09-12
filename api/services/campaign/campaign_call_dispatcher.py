@@ -14,7 +14,10 @@ from api.services.call_concurrency import (
     CallConcurrencySlot,
     call_concurrency,
 )
-from api.services.call_concurrency.rate_limiter import rate_limiter
+from api.services.call_concurrency.rate_limiter import (
+    FromNumberAcquisition,
+    rate_limiter,
+)
 from api.services.campaign.circuit_breaker import circuit_breaker
 from api.services.campaign.errors import (
     ConcurrentSlotAcquisitionError,
@@ -184,20 +187,27 @@ class CampaignCallDispatcher:
                             f"(retry_reason={current_queued_run.retry_reason}) awaiting dial"
                         )
                     else:
-                        # Update queued run as processed
-                        await db_client.update_queued_run(
-                            queued_run_id=queued_run.id,
-                            state="processed",
-                            processed_at=datetime.now(UTC),
+                        # Conditional on this batch still owning the claim. A run
+                        # that was parked, granted, then claimed and completed by
+                        # another batch is no longer ours: rewriting it here
+                        # would clobber that batch's processed_at.
+                        claimed = await db_client.mark_queued_run_processed_if_owned(
+                            queued_run.id
                         )
+                        if not claimed:
+                            logger.info(
+                                f"[Campaign {campaign_id}] Queued run {queued_run.id} was "
+                                f"already finished elsewhere (state="
+                                f"{getattr(current_queued_run, 'state', None)}); leaving it alone"
+                            )
+                        else:
+                            processed_count += 1
 
-                        processed_count += 1
                         processed_run_ids.add(queued_run.id)
 
-                        # Campaign processed count is accumulated and flushed
-                        # once for the whole batch below - writing
-                        # ``campaign.processed_rows + 1`` per item would store
-                        # the same value N times off one stale snapshot.
+                        # Only a signal that this batch changed something; the
+                        # actual counter is recomputed from queued-run state
+                        # below, so it cannot be inflated by a double write.
                         pending_processed_rows += 1
 
                 except asyncio.CancelledError:
@@ -275,50 +285,34 @@ class CampaignCallDispatcher:
 
         return processed_count
 
-    async def _flush_processed_rows(self, campaign_id: int, delta: int) -> None:
-        """Add ``delta`` to the campaign's processed_rows counter.
+    async def _flush_processed_rows(self, campaign_id: int, changed: int) -> None:
+        """Recompute the campaign's processed_rows from queued-run state.
 
-        The increment happens SQL-side, so a permission denial bumping the same
-        counter concurrently cannot be lost: reading the row here and writing
-        back ``current + delta`` would drop whichever write landed in between.
+        ``changed`` is only a "did this batch finish anything" signal, not a
+        delta. Maintaining the counter by increment meant three writers (batch
+        dispatch, permission denial, redial) each adding their own, so a
+        duplicate webhook or an overlapping batch could push progress past the
+        number of finished contacts, and a failed write lost it permanently.
+        Recomputing is idempotent, so neither can happen.
 
-        The runs are already marked processed by the time this runs, so simply
-        logging a failure would strand the delta forever. ``processed_rows`` is
-        a cache of queued-run state, not an independent fact, so a failed
-        increment falls back to recomputing it from those rows - which converges
-        on the truth instead of re-applying a delta against an unknown base.
+        Failure is survivable and deliberately not raised: the runs are already
+        marked processed, queued-run state remains authoritative, and campaign
+        completion is driven by queued counts rather than this number. The next
+        batch's sync corrects it.
         """
-        if delta <= 0:
+        if changed <= 0:
             return
 
         try:
-            await db_client.increment_campaign_processed_rows(
-                campaign_id=campaign_id, delta=delta
+            actual = await db_client.sync_campaign_processed_rows(campaign_id)
+            logger.debug(
+                f"Campaign {campaign_id} processed_rows synced to {actual}"
             )
-            return
         except Exception as e:
             logger.error(
-                f"Failed to increment processed_rows for campaign {campaign_id} "
-                f"by {delta}: {e}; reconciling from queued-run state instead."
-            )
-
-        try:
-            actual = await db_client.get_queued_runs_count(
-                campaign_id=campaign_id, states=["processed", "failed"]
-            )
-            await db_client.update_campaign(
-                campaign_id=campaign_id, processed_rows=actual
-            )
-            logger.info(
-                f"Reconciled processed_rows for campaign {campaign_id} to {actual} "
-                "from queued-run state."
-            )
-        except Exception as reconcile_err:
-            logger.error(
-                f"Could not reconcile processed_rows for campaign {campaign_id}: "
-                f"{reconcile_err}. Progress will under-report by {delta} until the "
-                "next successful flush; queued-run state remains authoritative and "
-                "campaign completion is unaffected (it is driven by queued counts)."
+                f"Failed to sync processed_rows for campaign {campaign_id}: {e}. "
+                "Progress will read stale until the next batch; queued-run state "
+                "remains authoritative and completion is unaffected."
             )
 
     async def _return_unprocessed_claims(
@@ -361,6 +355,7 @@ class CampaignCallDispatcher:
     ) -> Optional[WorkflowRunModel]:
         """Creates workflow run and initiates call. Requires a pre-acquired slot."""
         from_number = None
+        from_number_token = None
         workflow_run = None
         slot_bound = False
 
@@ -385,14 +380,16 @@ class CampaignCallDispatcher:
             # Acquire a unique from_number from the pool scoped to this campaign's
             # telephony configuration so orgs with multiple configs don't leak
             # caller IDs across configs.
-            from_number = await self.acquire_from_number(
+            from_number_acquisition = await self.acquire_from_number_with_token(
                 campaign.organization_id,
                 telephony_configuration_id=campaign.telephony_configuration_id,
             )
-            if from_number is None:
+            if from_number_acquisition is None:
                 raise PhoneNumberPoolExhaustedError(
                     organization_id=campaign.organization_id
                 )
+            from_number = from_number_acquisition.from_number
+            from_number_token = from_number_acquisition.token
 
             logger.info(f"Provider name: {provider.PROVIDER_NAME}")
             logger.info(f"Queued run context: {queued_run.context_variables}")
@@ -457,6 +454,7 @@ class CampaignCallDispatcher:
                 campaign.organization_id,
                 from_number,
                 telephony_configuration_id=campaign.telephony_configuration_id,
+                token=from_number_token,
             )
         except Exception:
             # Release slot and from_number on error
@@ -469,6 +467,7 @@ class CampaignCallDispatcher:
                     campaign.organization_id,
                     from_number,
                     telephony_configuration_id=campaign.telephony_configuration_id,
+                    expected_token=from_number_token,
                 )
             raise
 
@@ -776,19 +775,37 @@ class CampaignCallDispatcher:
     ) -> Optional[str]:
         """
         Acquire a from_number from the (org, telephony config) pool with retry.
-        Waits up to timeout seconds, polling every 1s.
+        Convenience wrapper delegating to acquire_from_number_with_token for
+        backwards compatibility with existing consumers.
+        """
+        acquisition = await self.acquire_from_number_with_token(
+            organization_id, telephony_configuration_id, timeout=timeout
+        )
+        return acquisition.from_number if acquisition else None
 
-        Returns:
-            The acquired phone number as a string, or None if timeout is exceeded.
+    async def acquire_from_number_with_token(
+        self,
+        organization_id: int,
+        telephony_configuration_id: int | None,
+        timeout: float = 600.0,
+    ) -> Optional[FromNumberAcquisition]:
+        """
+        Acquires from the (org, telephony config) pool with retry, returning
+        the number together with the ownership token
+        (the acquisition-time score) for the acquired number. dispatch_call
+        must carry this token into store_workflow_from_number_mapping and
+        into any release_from_number call for this acquisition, so a release
+        can never free a number that has since been re-acquired by another
+        call.
         """
         wait_start = time.time()
 
         while True:
-            from_number = await rate_limiter.acquire_from_number(
+            acquisition = await rate_limiter.acquire_from_number_with_token(
                 organization_id, telephony_configuration_id
             )
-            if from_number:
-                return from_number
+            if acquisition:
+                return acquisition
 
             wait_time = time.time() - wait_start
             if wait_time > timeout:
@@ -815,14 +832,26 @@ class CampaignCallDispatcher:
             workflow_run_id
         )
 
-        # Release from_number back to its (org, telephony config) pool
-        from_number_mapping = await rate_limiter.get_workflow_from_number_mapping(
-            workflow_run_id
+        # Release from_number back to its (org, telephony config) pool. In the
+        # normal case release_workflow_run_slot above has already released
+        # and deleted this mapping as part of its own cleanup; this is a
+        # best-effort retry for the case where that attempt hit a Redis error
+        # and deliberately kept the mapping around. Fetching the ownership
+        # token (when the mapping has one) and passing it through keeps this
+        # retry race-safe: it can only ever free OUR OWN acquisition, never
+        # one another call has since re-acquired.
+        from_number_mapping = (
+            await rate_limiter.get_workflow_from_number_mapping_with_token(
+                workflow_run_id
+            )
         )
         if from_number_mapping:
-            fn_org_id, fn_number, fn_tcid = from_number_mapping
+            fn_org_id, fn_number, fn_tcid, fn_token = from_number_mapping
             fn_success = await rate_limiter.release_from_number(
-                fn_org_id, fn_number, telephony_configuration_id=fn_tcid
+                fn_org_id,
+                fn_number,
+                telephony_configuration_id=fn_tcid,
+                expected_token=fn_token,
             )
             if fn_success:
                 await rate_limiter.delete_workflow_from_number_mapping(workflow_run_id)

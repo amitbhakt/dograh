@@ -82,22 +82,25 @@ def _get_recipient_number_candidates(recipient_phone_number: str) -> list[str]:
     return list(dict.fromkeys([c for c in candidates if c]))
 
 
-async def _select_permission_row(session, query, recipient_phone_number: str):
+async def _select_permission_row(session, query, key: str):
     """Pick one permission row, deterministically, and surface any duplicates.
 
-    Rows written before recipients were stored canonically may still exist under
-    several spellings, and the unique constraint cannot merge them because it
-    constrains the stored string. Ordering by id makes every reader agree on the
-    same row instead of taking an arbitrary one, so permission checks and webhook
-    updates cannot drift onto different records for the same recipient.
+    Two independent things can put more than one row on the same query: rows
+    written before recipients were stored canonically may still exist under
+    several spellings (the unique constraint can't merge them, since it
+    constrains the stored string), and ``meta_message_id`` lookups are
+    deliberately backed by a non-unique index since Meta can replay a wamid
+    across rows. Either way, ordering by id makes every reader agree on the
+    same row instead of taking an arbitrary one, so permission checks and
+    webhook updates cannot drift onto different records for the same
+    recipient or message.
     """
     result = await session.execute(query.order_by(WhatsAppCallPermissionModel.id))
     rows = list(result.scalars().all())
     if len(rows) > 1:
         logger.warning(
-            f"[WhatsApp Permission] {len(rows)} rows share recipient {recipient_phone_number} "
-            f"(ids={[r.id for r in rows]}); using {rows[0].id}. These predate canonical "
-            "recipient storage and should be merged."
+            f"[WhatsApp Permission] {len(rows)} rows share lookup key {key!r} "
+            f"(ids={[r.id for r in rows]}); using {rows[0].id}."
         )
     return rows[0] if rows else None
 
@@ -830,14 +833,21 @@ class TelephonyConfigurationClient(BaseDBClient):
 
         An omitted optional field keeps its stored value; an explicit ``None``
         clears it, so a decline reply drops the previous grant's expiry.
+
+        ``meta_message_id`` is backed by a deliberately non-unique index (see
+        ``ix_whatsapp_perm_meta_message_id``), so more than one row can share a
+        wamid; the lookup goes through ``_select_permission_row`` so it always
+        resolves to the same row instead of an arbitrary one, which would
+        otherwise grant or deny an unrelated recipient.
         """
         async with self.async_session() as session:
-            result = await session.execute(
+            row = await _select_permission_row(
+                session,
                 select(WhatsAppCallPermissionModel).where(
                     WhatsAppCallPermissionModel.meta_message_id == meta_message_id,
-                )
+                ),
+                meta_message_id,
             )
-            row = result.scalars().first()
             if not row:
                 return None
 

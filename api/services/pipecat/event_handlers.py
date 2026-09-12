@@ -182,10 +182,16 @@ def register_event_handlers(
     @transport.event_handler("on_client_connected")
     async def on_client_connected(_transport, _participant):
         logger.debug("In on_client_connected callback handler")
-        if call_answered_event is not None and not call_answered_event.is_set():
-            logger.info(
-                f"[run_id={workflow_run_id}] WebRTC connected but awaiting remote call answer before starting speech..."
-            )
+        if call_answered_event is not None:
+            # Deliberately NOT gated on `not is_set()`. A call terminated before
+            # this handler runs arrives here with the gate already resolved, and
+            # skipping the outcome check for that case would greet a dead call -
+            # the exact failure the gate exists to prevent. An already-resolved
+            # gate returns immediately, so always awaiting costs nothing.
+            if not call_answered_event.is_set():
+                logger.info(
+                    f"[run_id={workflow_run_id}] WebRTC connected but awaiting remote call answer before starting speech..."
+                )
             # The gate reports why it opened, so there is nothing to race and
             # nothing to wait out: a call that died before it was answered
             # releases this with TERMINATED, and an answered one with ANSWERED.

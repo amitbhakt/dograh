@@ -41,6 +41,7 @@ from .config import (
     WhatsAppConfigurationResponse,
 )
 from .provider import WhatsAppProvider
+from .service import resolve_live_call_state
 from .transport import create_transport
 
 
@@ -194,6 +195,10 @@ SPEC = ProviderSpec(
     config_response_cls=WhatsAppConfigurationResponse,
     ui_metadata=_UI_METADATA,
     account_id_credential_field="phone_number_id",  # Used for webhook routing
+    # Lets the shared call-status route read live WhatsApp call state without
+    # importing this package, and without the DB round-trip a provider
+    # instantiation would cost on a once-a-second poll.
+    live_call_state_resolver=resolve_live_call_state,
     # WhatsApp is a carrier you buy numbers from, not BYO-SIP
     connectivity="api",
     # Outbound calls require at least one phone number

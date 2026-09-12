@@ -402,7 +402,16 @@ class TelephonyPhoneNumberClient(BaseDBClient):
             if extra_metadata is not None:
                 row.extra_metadata = extra_metadata
 
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError as e:
+                # Clearing the previous default and setting the new one are two
+                # statements, not one: a concurrent update on the same
+                # configuration can clear-then-set in between them and both
+                # commits then race for uq_phone_numbers_default_caller. Same
+                # failure mode create_phone_number already handles.
+                await session.rollback()
+                raise TelephonyPhoneNumberConflictError(str(e)) from e
             await session.refresh(row)
             return row
 
@@ -415,7 +424,11 @@ class TelephonyPhoneNumberClient(BaseDBClient):
                 return None
             await self._clear_default_caller_id(session, telephony_configuration_id)
             row.is_default_caller_id = True
-            await session.commit()
+            try:
+                await session.commit()
+            except IntegrityError as e:
+                await session.rollback()
+                raise TelephonyPhoneNumberConflictError(str(e)) from e
             await session.refresh(row)
             return row
 

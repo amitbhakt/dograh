@@ -41,6 +41,29 @@ class NormalizedAddress:
     country_code: Optional[str] = None  # ISO-2; only set for PSTN when known
 
 
+_E164_RE = re.compile(r"^\+[1-9]\d{7,14}$")
+
+
+def is_e164(raw: Optional[str]) -> bool:
+    """Whether ``raw`` carries an explicit country code in strict E.164 form
+    (leading '+', no internal punctuation or whitespace, 8-15 digits, non-zero country code).
+
+    The single definition of "this number says which country it is for". Callers
+    that must not guess a country - notably the WhatsApp business-initiated-call
+    restriction check - gate on this instead of inferring one from leading
+    digits, which cannot be done reliably: a bare 11-digit number starting with
+    1 is a US number with its country code, or a Chinese mobile without one, and
+    nothing in the string distinguishes them.
+
+    Campaign leads are already held to this at ingest (``validate_source_data``
+    rejects any row whose phone number lacks a leading ``+``); this is the same
+    rule for the paths that do not go through a campaign source.
+    """
+    if not raw or not isinstance(raw, str):
+        return False
+    return bool(_E164_RE.fullmatch(raw.strip()))
+
+
 def normalize_telephony_address(
     raw: str, country_hint: Optional[str] = None
 ) -> NormalizedAddress:

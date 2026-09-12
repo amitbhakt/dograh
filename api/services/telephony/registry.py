@@ -244,6 +244,22 @@ TrunkRemover = Callable[[Dict[str, Any], TrunkDesiredState], Awaitable[None]]
 
 
 @dataclass(frozen=True)
+class LiveCallState:
+    """What a worker knows about a call that is still up in this process.
+
+    ``peer_connected`` and ``answered`` are deliberately separate. On most
+    providers media only flows once the call is answered, so the two coincide.
+    On WhatsApp the WebRTC transport comes up while the handset is still
+    ringing, so a connected peer says nothing about whether anyone picked up.
+    Collapsing them is what makes a ringing call report as connected.
+    """
+
+    call_id: Optional[str] = None
+    peer_connected: bool = False
+    answered: bool = False
+
+
+@dataclass(frozen=True)
 class ProviderSpec:
     """Everything needed to plug a telephony provider into the platform.
 
@@ -325,6 +341,14 @@ class ProviderSpec:
     # Optional hook reporting outstanding setup for a stored configuration.
     # Unset means the provider is ready as soon as its credentials are saved.
     setup_checklist_resolver: Optional[SetupChecklistResolver] = None
+    # Optional hook reporting what this worker knows, right now, about an
+    # in-flight call. Like setup_checklist_resolver it must be pure and
+    # synchronous: it is called from the call-status endpoint, which the UI
+    # polls once a second, so it may read in-process state only - never the
+    # database or the provider's API.
+    live_call_state_resolver: Optional[
+        Callable[[Optional[str], int], Optional["LiveCallState"]]
+    ] = None
     # Whether phone service is bought from this provider or brought to it.
     # Defaults to "api": most providers are carriers in their own right.
     connectivity: ProviderConnectivity = "api"

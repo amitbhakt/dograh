@@ -14,6 +14,7 @@ except ImportError:
     UTC = timezone.utc
 
 import asyncio
+from dataclasses import dataclass
 import hashlib
 import hmac
 import json
@@ -77,6 +78,13 @@ from pipecat.transports.whatsapp.client import WhatsAppClient
 
 router = APIRouter(prefix="/whatsapp")
 
+# Routes published directly under /telephony instead of /telephony/whatsapp.
+# Meta is configured against /api/v1/telephony/webhook, so that path cannot move
+# to the prefixed router without breaking every existing app subscription. The
+# handlers belong here regardless - api/routes/telephony.py is for cross-provider
+# glue only (see providers/AGENTS.md).
+unprefixed_router = APIRouter()
+
 from api.services.telephony.providers.whatsapp.service import (
     REDIS_CALL_EVENTS_CHANNEL,
     REDIS_PERMISSION_CHANNEL,
@@ -101,9 +109,12 @@ from api.services.telephony.providers.whatsapp.service import (
     get_http_session,
     get_or_create_whatsapp_client,
     get_whatsapp_redis,
+    handle_call_terminate,
     listen_for_remote_events,
     register_outbound_active_connection,
     set_pipeline_runner,
+    terminate_whatsapp_call_by_id,
+    _handle_call_terminate,
 )
 
 
@@ -890,8 +901,9 @@ async def _run_whatsapp_pipeline(
         answered_evt = _outbound_answered_events.pop(call_id, None)
         if answered_evt:
             answered_evt.resolve(TERMINATED)
+        provider_terminated = False
         try:
-            await terminate_whatsapp_call_by_id(
+            provider_terminated = await terminate_whatsapp_call_by_id(
                 call_id=call_id,
                 workflow_run_id=workflow_run_id,
                 organization_id=organization_id,
@@ -901,123 +913,23 @@ async def _run_whatsapp_pipeline(
                 f"[WhatsApp] Failed to send terminate in pipeline cleanup for call {call_id}: {term_err}"
             )
         _active_connections.pop(call_id, None)
-        try:
-            redis = await _get_redis()
-            if redis:
-                await redis.delete(f"{WHATSAPP_CALL_KEY_PREFIX}{call_id}")
-        except Exception:
-            pass
+        # Only clear the Redis recovery key once Meta has actually confirmed the
+        # hangup. terminate_whatsapp_call_by_id -> _handle_call_terminate already
+        # leaves the key in place when termination is unconfirmed so a retry can
+        # recover phone_number_id/organization_id for call_id; an unconditional
+        # delete here would undo that preservation immediately afterwards.
+        if provider_terminated:
+            try:
+                redis = await _get_redis()
+                if redis:
+                    await redis.delete(f"{WHATSAPP_CALL_KEY_PREFIX}{call_id}")
+            except Exception:
+                pass
         try:
             await call_concurrency.release_workflow_run_slot(workflow_run_id)
         except Exception as e:
             logger.warning(
                 f"[WhatsApp] Failed to release concurrency slot for workflow_run {workflow_run_id}: {e}"
-            )
-
-
-async def _handle_call_terminate(
-    call_data: Dict[str, Any],
-    payload: Dict[str, Any],
-    *,
-    provider_termination_unconfirmed: bool = False,
-) -> None:
-    """Handle a WhatsApp call termination event from Meta.
-
-    ``provider_termination_unconfirmed`` marks the case where we are tearing
-    down without Meta having acknowledged the hangup. Resources we own (peer
-    connection, pipeline, concurrency slot) still come down - leaving a pipeline
-    running against a call nobody is watching is strictly worse - but the Redis
-    recovery key is left in place so the call can still be identified and the
-    hangup re-issued. The durable stamp on the run is written by
-    ``terminate_whatsapp_call_by_id``, not here: this block only executes on the
-    worker that owns the connection, so a cross-worker terminate would otherwise
-    lose it.
-    """
-    call_id = call_data.get("id") or ""
-    if not call_id:
-        return
-    logger.info(f"[WhatsApp] Processing terminate event for call {call_id}")
-
-    # Broadcast terminate to owning worker via Redis pub/sub and delete call key
-    try:
-        redis = await _get_redis()
-        if redis:
-            if not provider_termination_unconfirmed:
-                await redis.delete(f"{WHATSAPP_CALL_KEY_PREFIX}{call_id}")
-            await redis.publish(
-                REDIS_TERMINATE_CHANNEL,
-                json.dumps({"call_id": call_id}),
-            )
-    except Exception as e:
-        logger.warning(f"[WhatsApp] Failed to publish terminate to Redis: {e}")
-
-    answered_evt = _outbound_answered_events.pop(call_id, None)
-    if answered_evt:
-        answered_evt.resolve(TERMINATED)
-
-    entry = _active_connections.pop(call_id, None)
-    if entry:
-        connection, workflow_run_id, org_id = entry[:3]
-        try:
-            await connection.disconnect()
-            logger.info(f"[WhatsApp] Peer connection closed for call {call_id}")
-        except Exception as e:
-            logger.warning(f"[WhatsApp] Error during peer connection disconnect: {e}")
-
-        # Mark workflow run state if still running
-        try:
-            errors = call_data.get("errors") or []
-            err_msg = None
-            if errors and isinstance(errors, list) and len(errors) > 0:
-                err_msg = errors[0].get("title") or errors[0].get("message")
-            run = await db_client.get_workflow_run(workflow_run_id)
-            ctx = dict(run.gathered_context or {}) if run else {}
-            ctx["call_status"] = "failed" if err_msg else "completed"
-            ctx["ended_at"] = datetime.now(timezone.utc).isoformat()
-            if err_msg:
-                ctx["error"] = err_msg
-            await db_client.update_workflow_run(
-                workflow_run_id,
-                is_completed=True,
-                state=WorkflowRunState.COMPLETED.value,
-                gathered_context=ctx,
-            )
-        except Exception as e:
-            logger.warning(f"[WhatsApp] Failed to update workflow run on termination: {e}")
-
-        try:
-            await call_concurrency.release_workflow_run_slot(workflow_run_id)
-        except Exception as e:
-            logger.warning(
-                f"[WhatsApp] Failed to release concurrency slot on terminate for {workflow_run_id}: {e}"
-            )
-    else:
-        # Cross-worker termination cleanup: when webhook hits a different worker instance
-        try:
-            run = await db_client.get_workflow_run_by_call_id(call_id)
-            if run and not run.is_completed:
-                logger.info(
-                    f"[WhatsApp] Cleaning up cross-worker workflow run {run.id} for terminated call {call_id}"
-                )
-                errors = call_data.get("errors") or []
-                err_msg = None
-                if errors and isinstance(errors, list) and len(errors) > 0:
-                    err_msg = errors[0].get("title") or errors[0].get("message")
-                ctx = dict(run.gathered_context or {})
-                ctx["call_status"] = "failed" if err_msg else "completed"
-                ctx["ended_at"] = datetime.now(timezone.utc).isoformat()
-                if err_msg:
-                    ctx["error"] = err_msg
-                await db_client.update_workflow_run(
-                    run.id,
-                    is_completed=True,
-                    state=WorkflowRunState.COMPLETED.value,
-                    gathered_context=ctx,
-                )
-                await call_concurrency.release_workflow_run_slot(run.id)
-        except Exception as e:
-            logger.warning(
-                f"[WhatsApp] Failed cross-worker terminate cleanup for call {call_id}: {e}"
             )
 
 
@@ -1134,16 +1046,17 @@ async def _handle_call_accepted(
 def install_whatsapp_pipeline_runner() -> None:
     """Wire the WhatsApp voice pipeline runner into the service layer.
 
-    Called from each composition root that can place or receive a WhatsApp call
-    (the FastAPI app and the ARQ worker). The module-level call below keeps any
-    process that mounts these routes working; the explicit function is what lets
-    a worker that never touches HTTP wire it deterministically, instead of the
-    service layer importing this module mid-call to trigger a side effect.
+    Called explicitly from each composition root that can place or receive a
+    WhatsApp call: the FastAPI app's lifespan and the ARQ worker's on_startup.
+
+    Deliberately NOT invoked at module scope. Registering as an import side
+    effect is what made pipeline availability depend on whether something had
+    happened to import this module yet - the ARQ worker only did so via a cron,
+    so a campaign call dispatched before that cron ran registered with no
+    pipeline behind it. Keeping the side effect alongside the explicit calls
+    would leave that original coupling in place while looking fixed.
     """
     set_pipeline_runner(_run_whatsapp_pipeline)
-
-
-install_whatsapp_pipeline_runner()
 
 
 def get_active_whatsapp_connection_by_call_id(
@@ -1161,139 +1074,6 @@ def get_active_whatsapp_connection_by_run_id(
         if entry[1] == workflow_run_id:
             return cid, entry[0]
     return None
-
-
-async def terminate_whatsapp_call_by_id(
-    call_id: str,
-    workflow_run_id: Optional[int] = None,
-    organization_id: Optional[int] = None,
-) -> bool:
-    """Terminate an active WhatsApp call locally and via Meta Graph API."""
-    answered_evt = _outbound_answered_events.pop(call_id, None)
-    if answered_evt:
-        answered_evt.resolve(TERMINATED)
-
-    phone_number_id = None
-    entry = _active_connections.get(call_id)
-    if entry:
-        phone_number_id = entry[3]
-        if not workflow_run_id:
-            workflow_run_id = entry[1]
-    elif call_id:
-        try:
-            redis = await _get_redis()
-            if redis:
-                raw_data = await redis.get(f"{WHATSAPP_CALL_KEY_PREFIX}{call_id}")
-                if raw_data:
-                    data = json.loads(raw_data)
-                    phone_number_id = data.get("phone_number_id")
-                    if not workflow_run_id:
-                        workflow_run_id = data.get("workflow_run_id")
-        except Exception as e:
-            logger.warning(f"[WhatsApp] Redis lookup error during termination: {e}")
-
-    # Fallback to workflow run gathered_context
-    if not phone_number_id and workflow_run_id:
-        try:
-            run = await db_client.get_workflow_run(workflow_run_id)
-            if run:
-                ctx = run.gathered_context or {}
-                phone_number_id = ctx.get("from_phone_number_id") or ctx.get("phone_number_id")
-                if not organization_id:
-                    organization_id = run.organization_id
-        except Exception:
-            pass
-
-    # 1. Ask Meta Graph API to terminate the call on user device.
-    # Tracked separately from the local teardown below: if Meta never confirms,
-    # the recipient's leg may still be up, and the caller must not be told the
-    # hang-up succeeded.
-    provider_terminated = False
-    try:
-        config = None
-        if phone_number_id:
-            config = await db_client.get_whatsapp_configuration_by_phone_number_id(
-                str(phone_number_id)
-            )
-        if not config and organization_id:
-            # Org-scoped: list_active_telephony_configurations_by_provider is
-            # cross-org and takes only `provider`, so the previous call both
-            # raised TypeError (swallowed by the except below, which is why this
-            # fallback never once worked) and would have reached another
-            # tenant's credentials if it had.
-            configs = await db_client.list_telephony_configurations_by_provider(
-                organization_id, "whatsapp"
-            )
-            config = configs[0] if configs else None
-
-        if config:
-            creds = config.credentials or {}
-            access_token = creds.get("access_token") or creds.get("api_key")
-            app_secret = creds.get("app_secret")
-            config_phone_number_id = str(creds.get("phone_number_id") or phone_number_id or "")
-            if access_token and config_phone_number_id:
-                client = _get_or_create_whatsapp_client(
-                    config_phone_number_id, access_token, app_secret
-                )
-                if client and client._whatsapp_api:
-                    resp = await client._whatsapp_api.terminate_call_to_whatsapp(call_id)
-                    provider_terminated = True
-                    logger.info(
-                        f"[WhatsApp] Sent terminate request to Meta API for call {call_id}: resp={resp}"
-                    )
-                else:
-                    logger.warning(
-                        f"[WhatsApp] Cannot terminate call {call_id} at Meta: no API client"
-                    )
-            else:
-                logger.warning(
-                    f"[WhatsApp] Cannot terminate call {call_id}: missing access_token or phone_number_id"
-                )
-        else:
-            logger.warning(
-                f"[WhatsApp] Cannot terminate call {call_id}: no active WhatsApp configuration found"
-            )
-    except Exception as e:
-        logger.warning(f"[WhatsApp] Meta Graph API termination failed: {e}")
-
-    # 2. Tear down locally. This runs even when Meta did not confirm: dropping
-    # our peer usually ends the call anyway, and leaving a pipeline and a
-    # concurrency slot held for a call nobody can observe is worse. What we do
-    # NOT do in that case is discard the call's identity - see
-    # provider_termination_unconfirmed, which keeps the Redis recovery key and
-    # stamps the run so the hangup can be re-issued against the same call.
-    await _handle_call_terminate(
-        {"id": call_id},
-        {},
-        provider_termination_unconfirmed=not provider_terminated,
-    )
-
-    if not provider_terminated:
-        logger.error(
-            f"[WhatsApp] Local teardown for call {call_id} completed, but Meta never "
-            "confirmed termination; the recipient's leg may still be connected."
-        )
-
-    # Stamp the run here rather than inside the teardown: this runs on whichever
-    # worker handled the request, owning the connection or not, so the durable
-    # record of an unconfirmed hangup survives a cross-worker terminate. Also
-    # clears the stamp when a retry finally succeeds - that retry has no active
-    # connection left, so the teardown's run update is skipped entirely.
-    if workflow_run_id:
-        try:
-            run = await db_client.get_workflow_run(workflow_run_id)
-            ctx = dict(run.gathered_context or {}) if run else {}
-            if ctx.get("provider_termination_unconfirmed") != (not provider_terminated):
-                ctx["provider_termination_unconfirmed"] = not provider_terminated
-                await db_client.update_workflow_run(
-                    workflow_run_id, gathered_context=ctx
-                )
-        except Exception as e:
-            logger.warning(
-                f"[WhatsApp] Failed recording termination-confirmation state for "
-                f"run {workflow_run_id}: {e}"
-            )
-    return provider_terminated
 
 
 async def _handle_user_call_permissions_change(
@@ -1388,12 +1168,35 @@ async def reactivate_campaign_runs_for_recipient(
         from api.tasks.arq import enqueue_job
         from api.tasks.function_names import FunctionNames
 
-        # Resolve target configuration id if phone_number_id is supplied
+        # Resolve target configuration id if phone_number_id is supplied.
+        #
+        # get_queued_runs_awaiting_whatsapp_permission searches parked runs
+        # across every organization - the recipient number is the only key it
+        # has - so target_config_id is the ONLY tenant boundary on the filter
+        # below. Letting an unresolved id fall through to "no filter" would let
+        # one business's grant or denial activate or fail another business's
+        # campaign run for the same recipient. Resolution can legitimately fail:
+        # the configuration may have been deactivated since the webhook was
+        # verified, or the id may resolve ambiguously (that lookup refuses to
+        # guess). Refuse rather than run unscoped.
         target_config_id = telephony_configuration_id
         if target_config_id is None and phone_number_id:
             cfg = await db_client.get_whatsapp_configuration_by_phone_number_id(phone_number_id)
-            if cfg:
-                target_config_id = cfg.id
+            if not cfg:
+                logger.error(
+                    f"[WhatsApp] Cannot resolve a telephony configuration for "
+                    f"phone_number_id={phone_number_id!r}; refusing to touch parked "
+                    f"runs for {clean_phone} without a tenant boundary."
+                )
+                return 0
+            target_config_id = cfg.id
+
+        if target_config_id is None and campaign_id is None:
+            logger.error(
+                f"[WhatsApp] Refusing to reactivate parked runs for {clean_phone}: "
+                "neither a telephony configuration nor a campaign scopes this request."
+            )
+            return 0
 
         waiting_runs = await db_client.get_queued_runs_awaiting_whatsapp_permission(clean_phone)
         if not waiting_runs:
@@ -1455,54 +1258,71 @@ async def reactivate_campaign_runs_for_recipient(
     return 0
 
 
+@dataclass(frozen=True)
+class WhatsAppPermissionSyncResult:
+    """Outcome of a permission sync.
+
+    ``throttled`` distinguishes "the cooldown skipped this run" from "we asked
+    Meta and nobody had granted permission". Both reactivate zero runs, and a
+    caller that only sees the count reports the second when it means the first.
+    """
+
+    reactivated: int = 0
+    throttled: bool = False
+
+
 async def sync_whatsapp_permissions_for_campaign(
     campaign_id: int, force: bool = False
-) -> int:
+) -> WhatsAppPermissionSyncResult:
     """
     Syncs WhatsApp call permission status from Meta Graph API for any leads parked
     in awaiting_whatsapp_permission for this campaign.
-    
+
     If permission has been granted, activates the queued run for immediate dialing.
-    If force is False, enforces a 30s cooldown per campaign via Redis to avoid spamming Meta.
-    Returns the count of reactivated runs.
+    If force is False, enforces a 30s cooldown per campaign via Redis to avoid
+    spamming Meta - each sync costs one Graph call per parked recipient.
+
+    The cooldown lives here and only here. Claiming it is the check: SET NX is
+    atomic, so two concurrent callers cannot both decide they are first, which a
+    separate read-then-write could. Callers must not reconstruct the key.
     """
     if not campaign_id:
-        return 0
-
-    redis_client = await _get_redis()
-    cooldown_key = f"wa_perm_sync_cooldown:{campaign_id}"
-    if not force and redis_client:
-        try:
-            if await redis_client.get(cooldown_key):
-                return 0
-        except Exception:
-            pass
+        return WhatsAppPermissionSyncResult()
 
     try:
         parked_runs = await db_client.get_all_queued_runs_awaiting_whatsapp_permission(
             campaign_id=campaign_id
         )
         if not parked_runs:
-            return 0
+            return WhatsAppPermissionSyncResult()
 
         campaign = await db_client.get_campaign_by_id(campaign_id)
         if not campaign or campaign.state != "running":
-            return 0
+            return WhatsAppPermissionSyncResult()
 
         if not campaign.telephony_configuration_id:
-            return 0
+            return WhatsAppPermissionSyncResult()
 
         config = await db_client.get_telephony_configuration(
             campaign.telephony_configuration_id
         )
         if not config or config.provider != "whatsapp":
-            return 0
+            return WhatsAppPermissionSyncResult()
 
         creds = config.credentials or {}
         phone_number_id = creds.get("phone_number_id")
         access_token = creds.get("access_token")
         if not phone_number_id or not access_token:
-            return 0
+            return WhatsAppPermissionSyncResult()
+
+        recipients = set()
+        for r in parked_runs:
+            pn = str((r.context_variables or {}).get("phone_number") or "").strip()
+            if pn:
+                recipients.add(pn)
+
+        if not recipients:
+            return WhatsAppPermissionSyncResult()
 
         client = _get_or_create_whatsapp_client(
             phone_number_id=phone_number_id,
@@ -1510,18 +1330,20 @@ async def sync_whatsapp_permissions_for_campaign(
             app_secret=creds.get("app_secret"),
         )
 
-        # Set 30s cooldown in Redis
-        if redis_client:
+        redis_client = await _get_redis()
+        cooldown_key = f"wa_perm_sync_cooldown:{campaign_id}"
+        if not force and redis_client:
+            try:
+                claimed = await redis_client.set(cooldown_key, "1", nx=True, ex=30)
+                if not claimed:
+                    return WhatsAppPermissionSyncResult(throttled=True)
+            except Exception:
+                pass
+        elif force and redis_client:
             try:
                 await redis_client.set(cooldown_key, "1", ex=30)
             except Exception:
                 pass
-
-        recipients = set()
-        for r in parked_runs:
-            pn = str((r.context_variables or {}).get("phone_number") or "").strip()
-            if pn:
-                recipients.add(pn)
 
         reactivated_total = 0
         now = datetime.now(UTC)
@@ -1595,10 +1417,10 @@ async def sync_whatsapp_permissions_for_campaign(
                     f"[WhatsApp] Failed checking call permission for {recipient} in campaign {campaign_id}: {e}"
                 )
 
-        return reactivated_total
+        return WhatsAppPermissionSyncResult(reactivated=reactivated_total)
     except Exception as e:
         logger.warning(f"[WhatsApp] Error in sync_whatsapp_permissions_for_campaign: {e}")
-        return 0
+        return WhatsAppPermissionSyncResult()
 
 
 async def sync_all_parked_whatsapp_permissions() -> int:
@@ -1610,7 +1432,9 @@ async def sync_all_parked_whatsapp_permissions() -> int:
         campaign_ids = {r.campaign_id for r in parked}
         total = 0
         for cid in campaign_ids:
-            total += await sync_whatsapp_permissions_for_campaign(cid, force=False)
+            total += (
+                await sync_whatsapp_permissions_for_campaign(cid, force=False)
+            ).reactivated
         return total
     except Exception as e:
         logger.warning(f"[WhatsApp] Error in sync_all_parked_whatsapp_permissions: {e}")
@@ -2005,4 +1829,23 @@ async def send_whatsapp_permission_request(
 @router.post("/permissions")
 async def handle_permission_callback(request: Request):
     """Handle permission callback webhooks from Meta for business-initiated calls."""
+    return await handle_whatsapp_webhook(request)
+
+
+@unprefixed_router.get("/webhook")
+async def handle_telephony_webhook_get(request: Request):
+    """Meta's verification handshake at the shared /telephony/webhook path."""
+    params = request.query_params
+    if "hub.mode" in params:
+        return await handle_webhook_verification(
+            hub_mode=params["hub.mode"],
+            hub_verify_token=params.get("hub.verify_token", ""),
+            hub_challenge=params.get("hub.challenge", ""),
+        )
+    raise HTTPException(status_code=404, detail="Not Found")
+
+
+@unprefixed_router.post("/webhook")
+async def handle_telephony_webhook_post(request: Request):
+    """Meta's event delivery at the shared /telephony/webhook path."""
     return await handle_whatsapp_webhook(request)

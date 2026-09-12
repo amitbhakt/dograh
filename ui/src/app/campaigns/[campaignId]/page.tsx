@@ -30,6 +30,7 @@ import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover
 import { Separator } from '@/components/ui/separator';
 import { CampaignRuns } from '@/components/workflow-runs';
 import { useOrganizationTimezone } from '@/hooks/useOrganizationTimezone';
+import { detailFromError } from '@/lib/apiError';
 import { useAuth } from '@/lib/auth';
 import { formatDate, formatDateTime } from '@/lib/dateTime';
 
@@ -67,6 +68,12 @@ export default function CampaignDetailPage() {
 
     // Telephony configurations, needed to know the campaign's actual provider
     const [telephonyConfigs, setTelephonyConfigs] = useState<TelephonyConfigurationListItem[]>([]);
+    // Whether the last lookup above failed. An empty `telephonyConfigs` from a
+    // failed request is indistinguishable from "no configs" unless this is
+    // tracked separately — and silently treating it as "no configs" makes a
+    // WhatsApp campaign look like plain voice (isWhatsAppCampaign below stays
+    // false), which skips the Meta permission sync on the runs reload.
+    const [telephonyConfigsError, setTelephonyConfigsError] = useState(false);
 
     // Redial dialog state
     const [isRedialDialogOpen, setIsRedialDialogOpen] = useState(false);
@@ -111,10 +118,19 @@ export default function CampaignDetailPage() {
             const res = await listTelephonyConfigurationsApiV1OrganizationsTelephonyConfigsGet({
                 headers: { 'Authorization': `Bearer ${accessToken}` },
             });
+            if (res.error) {
+                throw new Error(detailFromError(res.error, 'Failed to load telephony configurations'));
+            }
             // The endpoint returns { configurations: [...] }, not a bare array.
             setTelephonyConfigs(res.data?.configurations ?? []);
+            setTelephonyConfigsError(false);
         } catch (error) {
             console.error('Failed to fetch telephony configurations:', error);
+            // Do not fall back to an empty list here — that reads as "not a
+            // WhatsApp campaign" and would silently skip the Meta permission
+            // sync below. Surface the failure and let the user retry instead.
+            setTelephonyConfigsError(true);
+            toast.error('Failed to load telephony configuration. WhatsApp-specific actions may be unavailable until this is retried.');
         }
     }, [user, getAccessToken]);
 
@@ -664,6 +680,23 @@ export default function CampaignDetailPage() {
                         </div>
                     </div>
                 </div>
+
+                {telephonyConfigsError && (
+                    <div className="mb-6 rounded-md bg-destructive/15 p-3 text-sm text-destructive flex items-center justify-between gap-3">
+                        <span>
+                            Failed to load telephony configuration. Whether this is a WhatsApp
+                            campaign — and the Meta permission sync on run reload — could not
+                            be determined.
+                        </span>
+                        <Button
+                            variant="outline"
+                            size="sm"
+                            onClick={() => fetchTelephonyConfigs()}
+                        >
+                            Retry
+                        </Button>
+                    </div>
+                )}
 
                 {/* Campaign Details */}
                 <Card className="mb-6">

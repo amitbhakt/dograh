@@ -22,10 +22,12 @@ def upgrade() -> None:
     # update_whatsapp_call_permission_status_by_message_id resolves a row by
     # meta_message_id alone on every permission-message status and reply
     # webhook, and none of the indexes created with the table cover that
-    # column. meta_message_id is only set while a permission request is
-    # outstanding, so the partial predicate keeps the index to that small
-    # slice. Not unique on purpose: the webhook path should degrade to an
-    # extra row rather than a write failure if Meta ever replays a wamid.
+    # column. meta_message_id is set once an outbound request message is sent
+    # and is never cleared afterward, so the partial predicate does not limit
+    # this to outstanding requests -- it only excludes rows that never had a
+    # message id attached. Not unique on purpose: the webhook path should
+    # degrade to an extra row rather than a write failure if Meta ever
+    # replays a wamid.
     op.create_index(
         "ix_whatsapp_perm_meta_message_id",
         "whatsapp_call_permissions",
