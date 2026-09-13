@@ -1,0 +1,29 @@
+api/tests/test_telephony_address.py
+  s_b15e8a8ba568e5::t_1116fa49196fa2 82-85,88
+ui/src/app/campaigns/CampaignAdvancedSettings.tsx
+  s_b15e8a8ba568e5::t_1116fa49196fa2 62-71,165
+api/utils/telephony_address.py
+  s_b15e8a8ba568e5::t_1116fa49196fa2 58-63
+ui/src/app/workflow/[workflowId]/components/PhoneCallDialog.tsx
+  s_b15e8a8ba568e5::t_775b6688845d3d 488,515-518,741-743
+api/tests/test_campaign_source_phone_numbers.py
+  s_b15e8a8ba568e5::t_13915ee95a8cfb 21-23,28-29,39,44-49
+ui/src/app/telephony-configurations/[configId]/page.tsx
+  s_b15e8a8ba568e5::t_775b6688845d3d 584
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "22632e8bbebad7c9095423e4e2cc983563832a0b",
+  "prompts": {},
+  "sessions": {
+    "s_b15e8a8ba568e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4942cbf1-f1cf-470f-882d-692f09328558",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Amit Bhakt <yashubhakt@gmail.com>"
+    }
+  }
+}
