@@ -1,0 +1,28 @@
+api/tests/test_telephony_address.py
+  s_b15e8a8ba568e5::t_bf539321a3d577 70,72-86
+  s_b15e8a8ba568e5::t_99ec1479fa4764 71
+ui/src/app/campaigns/[campaignId]/edit/page.tsx
+  s_b15e8a8ba568e5::t_d529ee539e75c5 443
+ui/src/app/campaigns/CampaignAdvancedSettings.tsx
+  s_b15e8a8ba568e5::t_d529ee539e75c5 62-66,127,154-160
+api/utils/telephony_address.py
+  s_b15e8a8ba568e5::t_8b3ef210b3c62a 53-58
+ui/src/app/campaigns/new/page.tsx
+  s_b15e8a8ba568e5::t_d529ee539e75c5 533
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.5.2",
+  "base_commit_sha": "4ea49d40e0974f2cb1003c17dc11f9c9ece0c2f8",
+  "prompts": {},
+  "sessions": {
+    "s_b15e8a8ba568e5": {
+      "agent_id": {
+        "tool": "claude",
+        "id": "4942cbf1-f1cf-470f-882d-692f09328558",
+        "model": "claude-opus-5"
+      },
+      "human_author": "Amit Bhakt <yashubhakt@gmail.com>"
+    }
+  }
+}
